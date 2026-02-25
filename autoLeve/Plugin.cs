@@ -15,9 +15,10 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
+    [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
 
-    private const string CommandName = "/pmycommand";
+    private const string CommandName = "/alevetest";
 
     public Configuration Configuration { get; init; }
 
@@ -76,8 +77,8 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnCommand(string command, string args)
     {
-        // In response to the slash command, toggle the display status of our main ui
-        MainWindow.Toggle();
+        var message = string.IsNullOrWhiteSpace(args) ? command : $"{command} {args}";
+        ChatGui.Print($"收到指令：{message}");
     }
     
     public void ToggleConfigUi() => ConfigWindow.Toggle();
