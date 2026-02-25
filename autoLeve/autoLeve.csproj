@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
 
     <Version>0.0.0.1</Version>
-    <PackageProjectUrl>https://github.com/goatcorp/SamplePlugin</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/goatcorp/autoLeve</PackageProjectUrl>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
