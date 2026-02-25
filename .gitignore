@@ -1,4 +1,32 @@
+# Visual Studio / Rider / VS Code
 .vs/
-obj/
-bin/
+.idea/
+.vscode/
 *.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+**/bin/
+**/obj/
+
+# NuGet / .NET
+packages/
+*.nupkg
+*.snupkg
+*.nuget.props
+*.nuget.targets
+project.assets.json
+packages.lock.json
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
