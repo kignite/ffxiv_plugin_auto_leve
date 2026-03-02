@@ -5,6 +5,8 @@ using System.IO;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using autoLeve.Windows;
+using System.Numerics;
+using Dalamud.Game.ClientState.Objects;
 
 namespace autoLeve;
 
@@ -17,6 +19,11 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
+    [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
+    [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
 
     private const string CommandName = "/alevetest";
 
@@ -25,10 +32,19 @@ public sealed class Plugin : IDalamudPlugin
     public readonly WindowSystem WindowSystem = new("autoLeve");
     private ConfigWindow ConfigWindow { get; init; }
     private MainWindow MainWindow { get; init; }
+    internal SemiAutoLeveAssistant SemiAutoAssistant { get; }
 
     public Plugin()
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        EnsureDefaultNpcRouteConfiguration(Configuration);
+        SemiAutoAssistant = new SemiAutoLeveAssistant(
+            Configuration,
+            ChatGui,
+            Log,
+            GameGui,
+            ClientState,
+            GameInteropProvider);
 
         // You might normally want to embed resources and load them from the manifest stream
         var goatImagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");
@@ -53,11 +69,34 @@ public sealed class Plugin : IDalamudPlugin
 
         // Adds another button doing the same but for the main ui of the plugin
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
+        Framework.Update += OnFrameworkUpdate;
 
         // Add a simple message to the log with level set to information
         // Use /xllog to open the log window in-game
         // Example Output: 00:57:54.959 | INF | [autoLeve] ===A cool log message from Sample Plugin===
         Log.Information($"===A cool log message from {PluginInterface.Manifest.Name}===");
+    }
+
+    private static void EnsureDefaultNpcRouteConfiguration(Configuration config)
+    {
+        var changed = false;
+
+        if (!config.NpcAConfigured)
+        {
+            config.NpcAConfigured = true;
+            config.NpcAName = "格里格";
+            config.NpcATerritory = 962;
+            config.NpcAX = 46.83f;
+            config.NpcAY = -15.65f;
+            config.NpcAZ = 107.87f;
+            changed = true;
+        }
+
+        if (changed)
+        {
+            config.Save();
+        }
+
     }
 
     public void Dispose()
@@ -66,19 +105,75 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
+        Framework.Update -= OnFrameworkUpdate;
         
         WindowSystem.RemoveAllWindows();
 
         ConfigWindow.Dispose();
         MainWindow.Dispose();
+        SemiAutoAssistant.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
     }
 
     private void OnCommand(string command, string args)
     {
-        var message = string.IsNullOrWhiteSpace(args) ? command : $"{command} {args}";
-        ChatGui.Print($"收到指令：{message}");
+        var trimmedArgs = args.Trim();
+        if (!string.IsNullOrEmpty(trimmedArgs))
+        {
+            HandleAssistantCommand(trimmedArgs);
+            return;
+        }
+
+        var player = ClientState.LocalPlayer;
+        if (player == null)
+        {
+            ChatGui.Print("尚未登入角色。");
+            return;
+        }
+
+        Vector3 pos = player.Position;
+        ChatGui.Print($"座標: X={pos.X:F1}, Y={pos.Y:F1}, Z={pos.Z:F1}");
+    }
+
+    private void HandleAssistantCommand(string args)
+    {
+        switch (args.ToLowerInvariant())
+        {
+            case "semi on":
+                Configuration.SemiAutoLeveEnabled = true;
+                Configuration.Save();
+                ChatGui.Print("[autoLeve] 半自動模式已開啟。");
+                break;
+            case "semi off":
+                Configuration.SemiAutoLeveEnabled = false;
+                Configuration.Save();
+                SemiAutoAssistant.Stop("使用者關閉");
+                ChatGui.Print("[autoLeve] 半自動模式已關閉。");
+                break;
+            case "semi start":
+                SemiAutoAssistant.Start();
+                break;
+            case "semi stop":
+                SemiAutoAssistant.Stop("使用者停止");
+                break;
+            case "semi status":
+                ChatGui.Print($"[autoLeve] {SemiAutoAssistant.StatusSummary}");
+                break;
+            case "semi dump":
+                SemiAutoAssistant.DumpVisibleMenuEntries();
+                break;
+            default:
+                ChatGui.Print(
+                    "[autoLeve] 指令: /alevetest semi on|off|start|stop|status|dump (無參數則顯示座標)"
+                );
+                break;
+        }
+    }
+
+    private void OnFrameworkUpdate(IFramework framework)
+    {
+        SemiAutoAssistant.Update();
     }
     
     public void ToggleConfigUi() => ConfigWindow.Toggle();
