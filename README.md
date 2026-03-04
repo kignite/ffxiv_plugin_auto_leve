@@ -12,7 +12,7 @@ The plugin uses an **event-driven state machine** to detect NPC dialog windows a
 
 ## Demo
 
-![Demo](Data/demo.gif)
+![Demo](Data/autoLeve_demo.gif)
 
 Example automation flow:
 
