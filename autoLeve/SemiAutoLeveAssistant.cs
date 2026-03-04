@@ -1,11 +1,18 @@
 using Dalamud.Hooking;
+using Dalamud.Game.ClientState.Keys;
 using Dalamud.Game.Addon.Events;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Shell;
+using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 
 namespace autoLeve;
 
@@ -44,6 +51,8 @@ public enum NpcBStep
 public sealed class SemiAutoLeveAssistant : IDisposable
 {
     private const int GuildLeveAcceptTransitionTimeoutMs = 1800;
+    private const int BConfirmPressLimit = 15;
+    private static nint gameWindowHandle = nint.Zero;
 
     private enum GuildLeveCaptureMode
     {
@@ -107,8 +116,16 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     private bool waitingForNpcBTurnIn;
     private NpcBStep npcBStep = NpcBStep.AwaitTalkStart;
     private bool npcBTurnInHadInteraction;
+    private bool npcBCompletionObserved;
     private DateTime npcBTurnInStartedAtUtc;
     private DateTime npcBTurnInLastInteractionAtUtc;
+    private DateTime lastAutoRetargetAtUtc;
+    private DateTime lastAutoInteractKeyAtUtc;
+    private DateTime autoInteractBlockedUntilUtc;
+    private int npcBConfirmPressCount;
+    private bool pendingSwitchToAAfterDialogClose;
+    private DateTime pendingSwitchToAStartedAtUtc;
+    private int sessionTurnInCompletedCount;
     private bool guildLeveCallbackCaptureArmed;
     private int guildLeveCallbackCaptureRemaining;
     private DateTime guildLeveCallbackCaptureUntilUtc;
@@ -181,7 +198,7 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     }
 
     public string StatusSummary =>
-        $"Enabled={configuration.SemiAutoLeveEnabled}, TestA={configuration.SemiAutoTestFlowAEnabled}, TestB={configuration.SemiAutoTestFlowBEnabled}, Mode={lastMode}, AStep={npcAStep}, BWaiting={waitingForNpcBTurnIn}, BStep={npcBStep}, Talk={configuration.SemiAutoM3AutoAdvanceTalk}, Menu2={configuration.SemiAutoM3AutoSelectStringFirstOption}, Target={configuration.SemiAutoTargetLeveName}, ForceCb=[{configuration.SemiAutoGuildLeveSelectArg0},{configuration.SemiAutoGuildLeveSelectArg1},{configuration.SemiAutoGuildLeveSelectLeveId}], M34TwoArg={configuration.SemiAutoM34UseTwoArgCallback}[{configuration.SemiAutoM34TwoArgCmd},{configuration.SemiAutoM34TwoArgLeveId}], Armed={IsArmed}, State={State}" +
+        $"Enabled={configuration.SemiAutoLeveEnabled}, TestA={configuration.SemiAutoTestFlowAEnabled}, TestB={configuration.SemiAutoTestFlowBEnabled}, BConfirmSpam={configuration.SemiAutoBUseConfirmSpam}, BKeyConfirm={configuration.SemiAutoBUseKeyboardConfirmKey}, TurnIn={sessionTurnInCompletedCount}/{configuration.SemiAutoTargetTurnInCount}, Mode={lastMode}, AStep={npcAStep}, BWaiting={waitingForNpcBTurnIn}, BStep={npcBStep}, Talk={configuration.SemiAutoM3AutoAdvanceTalk}, Menu2={configuration.SemiAutoM3AutoSelectStringFirstOption}, Target={configuration.SemiAutoTargetLeveName}, ForceCb=[{configuration.SemiAutoGuildLeveSelectArg0},{configuration.SemiAutoGuildLeveSelectArg1},{configuration.SemiAutoGuildLeveSelectLeveId}], M34TwoArg={configuration.SemiAutoM34UseTwoArgCallback}[{configuration.SemiAutoM34TwoArgCmd},{configuration.SemiAutoM34TwoArgLeveId}], Armed={IsArmed}, State={State}" +
         (lastDetectedAddon is null ? string.Empty : $", LastAddon={lastDetectedAddon}");
 
     public void Start()
@@ -204,6 +221,13 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             return;
         }
 
+        // 依需求：腳本每次啟動前先切到烹調師裝備套組。
+        var gsOk = TrySendChatCommand("/gs change 烹調師");
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            log.Information("Semi-auto leve pre-start: /gs change 烹調師 => {Result}", gsOk ? "ok" : "failed");
+        }
+
         IsArmed = true;
         lastDetectedAddon = null;
         lastMode = NpcFlowMode.Unknown;
@@ -220,21 +244,37 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         waitingForNpcBTurnIn = false;
         npcBStep = NpcBStep.AwaitTalkStart;
         npcBTurnInHadInteraction = false;
+        npcBCompletionObserved = false;
         npcBTurnInStartedAtUtc = DateTime.MinValue;
         npcBTurnInLastInteractionAtUtc = DateTime.MinValue;
+        lastAutoRetargetAtUtc = DateTime.MinValue;
+        lastAutoInteractKeyAtUtc = DateTime.MinValue;
+        autoInteractBlockedUntilUtc = DateTime.MinValue;
+        npcBConfirmPressCount = 0;
+        pendingSwitchToAAfterDialogClose = false;
+        pendingSwitchToAStartedAtUtc = DateTime.MinValue;
+        sessionTurnInCompletedCount = 0;
 
-        if (!configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
+        if (configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
         {
-            waitingForNpcBTurnIn = true;
-            npcBStep = NpcBStep.AwaitTalkStart;
-            npcBTurnInStartedAtUtc = DateTime.UtcNow;
-            npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
+            EnterAFlow(true);
+        }
+        else if (!configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
+        {
+            EnterBFlow(true);
         }
 
         TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
         if (configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
         {
-            chatGui.Print("[autoLeve] 半自動理符助手已啟動，模式=A→B。");
+            if (configuration.SemiAutoTargetTurnInCount > 0)
+            {
+                chatGui.Print($"[autoLeve] 已開始 {configuration.SemiAutoTargetTurnInCount} 次理符繳交循環。");
+            }
+            else
+            {
+                chatGui.Print("[autoLeve] 已開始理符繳交循環（不限次數）。");
+            }
         }
         else if (configuration.SemiAutoTestFlowAEnabled)
         {
@@ -267,9 +307,21 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         waitingForNpcBTurnIn = false;
         npcBStep = NpcBStep.AwaitTalkStart;
         npcBTurnInHadInteraction = false;
+        npcBCompletionObserved = false;
         npcBTurnInStartedAtUtc = DateTime.MinValue;
         npcBTurnInLastInteractionAtUtc = DateTime.MinValue;
+        lastAutoRetargetAtUtc = DateTime.MinValue;
+        lastAutoInteractKeyAtUtc = DateTime.MinValue;
+        autoInteractBlockedUntilUtc = DateTime.MinValue;
+        npcBConfirmPressCount = 0;
+        pendingSwitchToAAfterDialogClose = false;
+        pendingSwitchToAStartedAtUtc = DateTime.MinValue;
+        sessionTurnInCompletedCount = 0;
         TransitionTo(SemiAutoLeveState.Idle);
+        if (!string.IsNullOrWhiteSpace(reason))
+        {
+            log.Warning("Semi-auto leve stopped: {Reason}", reason);
+        }
         if (!string.IsNullOrWhiteSpace(reason))
         {
             chatGui.Print($"[autoLeve] 半自動理符助手停止：{reason}");
@@ -348,6 +400,10 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         TryAttachAddonEventCapture();
         chatGui.Print("[autoLeve] 單步 ReceiveEvent 捕捉已啟用：請手動做一次操作。");
     }
+
+    public void MarkCurrentTargetAttack1() => MarkCurrentTarget("attack1");
+
+    public void MarkCurrentTargetAttack2() => MarkCurrentTarget("attack2");
 
     public void ReplayLastCapturedCallback(string? targetAddonOverride)
     {
@@ -664,11 +720,19 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         if (flowMode != NpcFlowMode.Unknown && lastMode != flowMode)
         {
             lastMode = flowMode;
-            chatGui.Print("[autoLeve] 進入 NPC A 流程（接理符）");
         }
 
         if (detected is null)
         {
+            if (pendingSwitchToAAfterDialogClose)
+            {
+                pendingSwitchToAAfterDialogClose = false;
+                pendingSwitchToAStartedAtUtc = DateTime.MinValue;
+                EnterAFlow(true);
+                TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
+                return;
+            }
+
             if (npcAStep == NpcAStep.AwaitNpcAInteractionEnd && guildLeveAcceptRetryStage > 0)
             {
                 CompleteAFlowAfterAccept();
@@ -679,7 +743,12 @@ public sealed class SemiAutoLeveAssistant : IDisposable
                 npcBTurnInHadInteraction &&
                 (DateTime.UtcNow - npcBTurnInLastInteractionAtUtc).TotalMilliseconds > 1200)
             {
-                Stop("B 流程完成（交貨視窗已關閉）");
+                var counted = npcBCompletionObserved;
+                if (!counted)
+                {
+                    log.Warning("Semi-auto leve B flow closed without JournalResult, skip counting this round.");
+                }
+                CompleteBFlow("B 流程完成（交貨視窗已關閉）", counted: counted);
                 return;
             }
 
@@ -687,6 +756,8 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             {
                 TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
             }
+
+            TryAutoInitiateNpcDialogByMark();
             return;
         }
 
@@ -697,13 +768,62 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             TransitionTo(SemiAutoLeveState.DialogDetected);
         }
 
-        if (TryMarkPhaseLogged($"detected:{detectedAddon}"))
+        if (pendingSwitchToAAfterDialogClose)
         {
-            chatGui.Print($"[autoLeve] 偵測到對話視窗：{detectedAddon}");
-            if (configuration.SemiAutoVerboseLogging)
+            var pendingMs = (DateTime.UtcNow - pendingSwitchToAStartedAtUtc).TotalMilliseconds;
+            if (pendingMs > 6000)
             {
-                log.Information("Semi-auto leve dialog detected: {AddonName}", detectedAddon);
+                pendingSwitchToAAfterDialogClose = false;
+                pendingSwitchToAStartedAtUtc = DateTime.MinValue;
+                EnterAFlow(true);
+                TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
+                chatGui.Print("[autoLeve] B 收尾逾時，強制切回 attack1 並進入 A 流程。");
+                if (configuration.SemiAutoVerboseLogging)
+                {
+                    log.Warning("Semi-auto leve B->A drain timeout, force switch to A. addon={Addon}", detectedAddon);
+                }
+                return;
             }
+
+            // B 結束後若還有對話視窗，持續推進/關閉，直到 detected=null 才切回 A。
+            if (detectedAddon == "Talk")
+            {
+                // Talk 視窗優先用 NUM0，更接近玩家實際操作。
+                if (TryStartActionWindow(120))
+                {
+                    _ = TrySendConfirmKeyNumpad0() || TrySendCallbackConfirm(detectedAddon, addonPtr);
+                }
+            }
+            else if (TryStartActionWindow(120))
+            {
+                var closed = false;
+                if (detectedAddon == "SelectString")
+                {
+                    if (TryFindCallbackIndexByText(addonPtr, "取消", out var cancelCb))
+                    {
+                        closed = TryFireCallbackInt(addonPtr, cancelCb);
+                    }
+                    else
+                    {
+                        closed = TryFireCallbackInt(addonPtr, 3);
+                    }
+                }
+                else
+                {
+                    closed = TrySendCallbackConfirm(detectedAddon, addonPtr);
+                }
+
+                if (closed && configuration.SemiAutoVerboseLogging)
+                {
+                    log.Information("Semi-auto leve B->A drain: advance addon={Addon}", detectedAddon);
+                }
+            }
+            return;
+        }
+
+        if (TryMarkPhaseLogged($"detected:{detectedAddon}") && configuration.SemiAutoVerboseLogging)
+        {
+            log.Information("Semi-auto leve dialog detected: {AddonName}", detectedAddon);
         }
 
         if (waitingForNpcBTurnIn)
@@ -724,6 +844,17 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     {
         if (!IsNpcBTurnInAddon(detectedAddon))
         {
+            return;
+        }
+
+        if (detectedAddon == "JournalResult")
+        {
+            npcBCompletionObserved = true;
+        }
+
+        if (configuration.SemiAutoBUseConfirmSpam)
+        {
+            HandleNpcBTurnInStepByConfirmSpam(detectedAddon, addonPtr);
             return;
         }
 
@@ -803,10 +934,113 @@ public sealed class SemiAutoLeveAssistant : IDisposable
                 if (detectedAddon == "JournalResult" && TryFireCallbackInt(addonPtr, 0))
                 {
                     MarkNpcBAction(detectedAddon, "0", NpcBStep.AwaitJournalResult);
-                    Stop("B 流程完成（JournalResult）");
+                    CompleteBFlow("B 流程完成（JournalResult）", counted: true);
                 }
                 break;
         }
+    }
+
+    private void TryAutoInitiateNpcDialogByMark()
+    {
+        if (!IsArmed)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var mark = waitingForNpcBTurnIn ? "attack2" : "attack1";
+
+        if ((now - lastAutoRetargetAtUtc).TotalMilliseconds >= 1500)
+        {
+            TryTargetByMark(mark);
+            lastAutoRetargetAtUtc = now;
+            if (configuration.SemiAutoVerboseLogging)
+            {
+                log.Information("Semi-auto leve auto-init: retarget {Mark}", mark);
+            }
+        }
+
+        if ((now - lastAutoInteractKeyAtUtc).TotalMilliseconds < 450)
+        {
+            return;
+        }
+
+        if (now < autoInteractBlockedUntilUtc)
+        {
+            return;
+        }
+
+        if (TrySendConfirmKeyNumpad0())
+        {
+            lastAutoInteractKeyAtUtc = now;
+            if (configuration.SemiAutoVerboseLogging)
+            {
+                log.Information("Semi-auto leve auto-init: send confirm key NUM0");
+            }
+        }
+    }
+
+    private void HandleNpcBTurnInStepByConfirmSpam(string detectedAddon, nint addonPtr)
+    {
+        if (!TryStartActionWindow(120))
+        {
+            return;
+        }
+
+        var didSendConfirm = configuration.SemiAutoBUseKeyboardConfirmKey
+            ? TrySendConfirmKeyNumpad0()
+            : TrySendCallbackConfirm(detectedAddon, addonPtr);
+        if (!didSendConfirm)
+        {
+            return;
+        }
+
+        if (!TryConsumeBConfirmBudget("B-confirm-spam"))
+        {
+            return;
+        }
+
+        npcBTurnInHadInteraction = true;
+        npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
+
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            var mode = configuration.SemiAutoBUseKeyboardConfirmKey ? "NUM0" : "callback0";
+            log.Information("Semi-auto leve B confirm-spam: addon={Addon}, mode={Mode}", detectedAddon, mode);
+        }
+    }
+
+    private bool TrySendCallbackConfirm(string detectedAddon, nint addonPtr)
+    {
+        return detectedAddon switch
+        {
+            "Talk" => TryFireCallbackEmpty(addonPtr) || TryFireCallbackInt(addonPtr, 0),
+            "Request" => TryFireCallbackInt(addonPtr, 0),
+            "RequestItem" => TryFireCallbackInt(addonPtr, 0),
+            "SelectYesno" => TryFireCallbackInt(addonPtr, 0),
+            "JournalResult" => TryFireCallbackInt(addonPtr, 0),
+            _ => false,
+        };
+    }
+
+    private bool TrySendConfirmKeyNumpad0()
+    {
+        var hWnd = gameWindowHandle;
+        if (hWnd == nint.Zero)
+        {
+            hWnd = Process.GetCurrentProcess().MainWindowHandle;
+            gameWindowHandle = hWnd;
+        }
+
+        if (hWnd == nint.Zero)
+        {
+            return false;
+        }
+
+        _ = SendMessage(hWnd, 0x100, (nint)VirtualKey.NUMPAD0, nint.Zero); // WM_KEYDOWN
+        Thread.Sleep(40);
+        _ = SendMessage(hWnd, 0x101, (nint)VirtualKey.NUMPAD0, nint.Zero); // WM_KEYUP
+        return true;
     }
 
     private unsafe bool TryFireCallbackEmpty(nint addonPtr)
@@ -908,7 +1142,6 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         npcBTurnInHadInteraction = true;
         npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
         npcBStep = nextStep;
-        chatGui.Print($"[autoLeve] B 流程交貨：{addon} callback {callbackLabel}");
         if (configuration.SemiAutoVerboseLogging)
         {
             log.Information("Semi-auto leve B action: {Addon} callback {Callback}, next={NextStep}", addon, callbackLabel, nextStep);
@@ -1278,6 +1511,76 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         }
     }
 
+    private bool TryStopIfLeveAllowanceExhausted(nint addonPtr)
+    {
+        if (!TryResolveLeveAllowance(addonPtr, out var allowance, out var source))
+        {
+            return false;
+        }
+
+        if (allowance > 0)
+        {
+            return false;
+        }
+
+        chatGui.Print("[autoLeve] 偵測到理符次數耗盡（受理限額=0），停止自動循環。");
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            log.Warning("Semi-auto leve stop: allowance exhausted (source={Source})", source);
+        }
+        Stop("理符次數耗盡（受理限額=0）");
+        return true;
+    }
+
+    private unsafe bool TryResolveLeveAllowance(nint addonPtr, out int allowance, out string source)
+    {
+        allowance = -1;
+        source = "(none)";
+        if (addonPtr == nint.Zero)
+        {
+            return false;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible || unitBase->AtkValues == null)
+        {
+            return false;
+        }
+
+        var count = unitBase->AtkValuesCount;
+        for (var i = 0; i < count; i++)
+        {
+            var text = unitBase->AtkValues[i].GetValueAsString()?.Trim();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            // 僅使用已驗證可靠的訊號：
+            // 在「已經領取全部現有理符。」前一格會放剩餘次數（如 12、0）。
+            // 注意：不要用「受理限額 0/16」判斷，該欄位的左值是已受理數，不是理符剩餘次數。
+            if (text.Contains("已經領取全部現有理符", StringComparison.Ordinal))
+            {
+                for (var back = i - 1; back >= Math.Max(0, i - 6); back--)
+                {
+                    var prev = unitBase->AtkValues[back].GetValueAsString()?.Trim();
+                    if (string.IsNullOrWhiteSpace(prev))
+                    {
+                        continue;
+                    }
+
+                    if (int.TryParse(prev, out allowance) && allowance >= 0 && allowance <= 100)
+                    {
+                        source = $"before-full-msg@{back}:{prev}";
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
     private void CompleteAFlowAfterAccept()
     {
         npcAStep = NpcAStep.AwaitTalk;
@@ -1291,15 +1594,9 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         guildLeveAcceptRetryStage = 0;
         guildLeveExitAfterAcceptSent = false;
         lastGuildLeveExitActionAtUtc = DateTime.MinValue;
-        chatGui.Print("[autoLeve] 已點擊接受，A 流程完成。");
         if (configuration.SemiAutoTestFlowBEnabled)
         {
-            waitingForNpcBTurnIn = true;
-            npcBStep = NpcBStep.AwaitTalkStart;
-            npcBTurnInHadInteraction = false;
-            npcBTurnInStartedAtUtc = DateTime.UtcNow;
-            npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
-            chatGui.Print("[autoLeve] 進入 B 流程：Talk(empty) -> Request(4) -> Request(0) -> SelectYesno(0) -> Talk(empty) -> JournalResult(0)。");
+            EnterBFlow(configuration.SemiAutoTestFlowAEnabled);
             if (configuration.SemiAutoVerboseLogging)
             {
                 log.Information("Semi-auto leve action: GuildLeve accept complete");
@@ -1315,6 +1612,105 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     private static bool IsNpcBTurnInAddon(string addonName)
     {
         return addonName is "Talk" or "SelectString" or "SelectYesno" or "Request" or "RequestItem" or "JournalResult";
+    }
+
+    private void EnterAFlow(bool retargetAttack1)
+    {
+        waitingForNpcBTurnIn = false;
+        npcAStep = NpcAStep.AwaitTalk;
+        npcBConfirmPressCount = 0;
+        autoInteractBlockedUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
+        if (retargetAttack1)
+        {
+            TryTargetByMark("attack1");
+            autoInteractBlockedUntilUtc = DateTime.UtcNow.AddMilliseconds(700);
+        }
+    }
+
+    private void EnterBFlow(bool retargetAttack2)
+    {
+        waitingForNpcBTurnIn = true;
+        npcBStep = NpcBStep.AwaitTalkStart;
+        npcBTurnInHadInteraction = false;
+        npcBCompletionObserved = false;
+        npcBTurnInStartedAtUtc = DateTime.UtcNow;
+        npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
+        npcBConfirmPressCount = 0;
+        autoInteractBlockedUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
+        if (retargetAttack2)
+        {
+            TryTargetByMark("attack2");
+            autoInteractBlockedUntilUtc = DateTime.UtcNow.AddMilliseconds(900);
+        }
+    }
+
+    private void CompleteBFlow(string reason, bool counted = false)
+    {
+        waitingForNpcBTurnIn = false;
+        npcBStep = NpcBStep.AwaitTalkStart;
+        npcBTurnInHadInteraction = false;
+        npcBCompletionObserved = false;
+        npcBTurnInStartedAtUtc = DateTime.MinValue;
+        npcBTurnInLastInteractionAtUtc = DateTime.MinValue;
+        npcBConfirmPressCount = 0;
+
+        if (counted)
+        {
+            sessionTurnInCompletedCount++;
+
+            if (configuration.SemiAutoTargetTurnInCount > 0 &&
+                sessionTurnInCompletedCount >= configuration.SemiAutoTargetTurnInCount)
+            {
+                Stop($"已達指定繳交次數：{sessionTurnInCompletedCount}/{configuration.SemiAutoTargetTurnInCount}");
+                return;
+            }
+        }
+
+        if (configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
+        {
+            pendingSwitchToAAfterDialogClose = true;
+            pendingSwitchToAStartedAtUtc = DateTime.UtcNow;
+            chatGui.Print("[autoLeve] B 流程完成，等待離開對話後切回 attack1。");
+            TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
+            return;
+        }
+
+        Stop(reason);
+    }
+
+    private void MarkCurrentTarget(string markName)
+    {
+        if (clientState.LocalPlayer == null)
+        {
+            chatGui.Print("[autoLeve] 尚未登入角色。");
+            return;
+        }
+
+        if (clientState.LocalPlayer.TargetObject == null)
+        {
+            chatGui.Print("[autoLeve] 目前沒有目標，請先選中 NPC。");
+            return;
+        }
+
+        var cmd = $"/mk {markName} <t>";
+        var ok = TrySendChatCommand(cmd);
+        chatGui.Print(ok
+            ? $"[autoLeve] 已標記目前目標為 {markName}。"
+            : $"[autoLeve] 標記失敗：{cmd}");
+    }
+
+    private void TryTargetByMark(string markName)
+    {
+        var ok = TrySendChatCommand($"/ta <{markName}>");
+        if (!ok)
+        {
+            ok = TrySendChatCommand($"/target <{markName}>");
+        }
+
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            log.Information("Semi-auto leve target by mark {Mark}: {Result}", markName, ok ? "ok" : "failed");
+        }
     }
 
     private NpcFlowMode ResolveFlowMode(NpcFlowMode positionalMode, string? detectedAddon)
@@ -2283,23 +2679,31 @@ public sealed class SemiAutoLeveAssistant : IDisposable
                 {
                     continue;
                 }
-            }
 
-            foreach (var eventType in CaptureEventTypes)
-            {
-                var handle = addonEventManager.AddEvent(addonPtr, nint.Zero, eventType, OnAddonEventCaptured);
-                if (handle != null)
+                var rootNodePtr = (nint)unit->RootNode;
+                if (rootNodePtr == nint.Zero)
                 {
-                    addonEventCaptureHandles.Add(handle);
+                    continue;
                 }
-            }
 
-            if (addonEventCaptureHandles.Count > 0)
-            {
-                addonEventCaptureAddonPtr = addonPtr;
-                addonEventCaptureAddonName = addonName;
-                chatGui.Print($"[autoLeve] 已綁定 UI事件捕捉: addon={addonName}, events={addonEventCaptureHandles.Count}");
-                return;
+                var registered = 0;
+                foreach (var eventType in CaptureEventTypes)
+                {
+                    var handle = addonEventManager.AddEvent(addonPtr, rootNodePtr, eventType, OnAddonEventCaptured);
+                    if (handle != null)
+                    {
+                        addonEventCaptureHandles.Add(handle);
+                        registered++;
+                    }
+                }
+
+                if (addonEventCaptureHandles.Count > 0)
+                {
+                    addonEventCaptureAddonPtr = addonPtr;
+                    addonEventCaptureAddonName = addonName;
+                    chatGui.Print($"[autoLeve] 已綁定 UI事件捕捉: addon={addonName}, root=0x{rootNodePtr:X}, events={registered}");
+                    return;
+                }
             }
         }
 
@@ -2526,6 +2930,60 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         return true;
     }
 
+    private unsafe bool TrySendChatCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return false;
+        }
+
+        var framework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance();
+        if (framework == null)
+        {
+            return false;
+        }
+
+        var uiModule = framework->GetUIModule();
+        if (uiModule == null)
+        {
+            return false;
+        }
+
+        var shellModule = uiModule->GetRaptureShellModule();
+        if (shellModule == null)
+        {
+            return false;
+        }
+
+        using var utf8 = new Utf8String();
+        utf8.SetString(command);
+        shellModule->ExecuteCommandInner(&utf8, uiModule);
+        return true;
+    }
+
+    private bool TryConsumeBConfirmBudget(string source)
+    {
+        npcBConfirmPressCount++;
+        if (npcBConfirmPressCount <= BConfirmPressLimit)
+        {
+            if (configuration.SemiAutoVerboseLogging)
+            {
+                log.Information("Semi-auto leve B confirm budget: {Count}/{Limit} source={Source}", npcBConfirmPressCount, BConfirmPressLimit, source);
+            }
+            return true;
+        }
+
+        log.Warning("Semi-auto leve B confirm budget exceeded: {Count}/{Limit} source={Source}", npcBConfirmPressCount, BConfirmPressLimit, source);
+        if (waitingForNpcBTurnIn)
+        {
+            CompleteBFlow($"B 流程確認操作超過 {BConfirmPressLimit} 次，改為收尾切回 A。");
+            return false;
+        }
+
+        Stop($"B 流程確認操作超過 {BConfirmPressLimit} 次，已停止。");
+        return false;
+    }
+
     private unsafe void DumpAddonAtkValues(string addonName, nint addonPtr)
     {
         if (addonPtr == nint.Zero)
@@ -2571,4 +3029,8 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             chatGui.Print("[autoLeve] 僅顯示前 25 筆，完整內容請看 /xllog。");
         }
     }
+
+    [DllImport("user32.dll")]
+    private static extern nint SendMessage(nint hWnd, int msg, nint wParam, nint lParam);
+
 }

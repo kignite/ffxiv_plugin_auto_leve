@@ -105,20 +105,24 @@ public class ConfigWindow : Window, IDisposable
             configuration.Save();
         }
 
-        var testFlowA = configuration.SemiAutoTestFlowAEnabled;
-        if (ImGui.Checkbox("測試流程 A（接理符）", ref testFlowA))
+        var bConfirmSpam = configuration.SemiAutoBUseConfirmSpam;
+        if (ImGui.Checkbox("B: 優先使用確認操作連按", ref bConfirmSpam))
         {
-            configuration.SemiAutoTestFlowAEnabled = testFlowA;
+            configuration.SemiAutoBUseConfirmSpam = bConfirmSpam;
             configuration.Save();
         }
+        var bKeyboardConfirm = configuration.SemiAutoBUseKeyboardConfirmKey;
+        if (ImGui.Checkbox("B: 連按時使用鍵盤NUM0(非callback0)", ref bKeyboardConfirm))
+        {
+            configuration.SemiAutoBUseKeyboardConfirmKey = bKeyboardConfirm;
+            configuration.Save();
+        }
+        ImGui.TextDisabled("A+B 建議用 attack1/attack2 標記循環：/ta <attack1> -> A -> /ta <attack2> -> B");
 
-        var testFlowB = configuration.SemiAutoTestFlowBEnabled;
-        if (ImGui.Checkbox("測試流程 B（繳交）", ref testFlowB))
+        if (ImGui.Button("收合/展開主視窗"))
         {
-            configuration.SemiAutoTestFlowBEnabled = testFlowB;
-            configuration.Save();
+            plugin.ToggleMainUi();
         }
-        ImGui.TextDisabled("A=開且B=關: 只測A；A=關且B=開: 只測B；A=開且B=開: A→B整段。");
 
         var actionDelay = configuration.SemiAutoActionDelayMs;
         if (ImGui.SliderInt("全域動作延遲(ms)", ref actionDelay, 200, 2000))
@@ -134,101 +138,6 @@ public class ConfigWindow : Window, IDisposable
             configuration.Save();
         }
 
-        ImGui.Separator();
-        ImGui.Text("流程捕捉");
-        if (ImGui.Button("記錄下一次操作(單步)"))
-        {
-            plugin.SemiAutoAssistant.ArmSingleStepCapture();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("記錄下一次UI事件(單步)"))
-        {
-            plugin.SemiAutoAssistant.ArmSingleReceiveEventCapture();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("啟用通用 callback 捕捉"))
-        {
-            plugin.SemiAutoAssistant.ArmAnyCallbackCaptureOnce();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("套用最近捕捉為B選物"))
-        {
-            plugin.SemiAutoAssistant.ApplyLastCapturedCallbackToBSelect();
-        }
-        var replayAddon = configuration.SemiAutoReplayTargetAddon;
-        if (ImGui.InputText("重播目標addon(留空=記錄addon)", ref replayAddon, 64))
-        {
-            configuration.SemiAutoReplayTargetAddon = replayAddon;
-            configuration.Save();
-        }
-        if (ImGui.Button("重播剛剛記錄"))
-        {
-            plugin.SemiAutoAssistant.ReplayLastCapturedCallback(configuration.SemiAutoReplayTargetAddon);
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("重播剛剛UI事件"))
-        {
-            plugin.SemiAutoAssistant.ReplayLastReceiveEvent(configuration.SemiAutoReplayTargetAddon);
-        }
-        ImGui.TextDisabled("先用通用捕捉記錄手動選物，再套用到 B 自動選物。");
-        ImGui.TextWrapped($"通用捕捉最近一次: {plugin.SemiAutoAssistant.LastGenericCaptureSummary}");
-        ImGui.TextWrapped($"UI事件捕捉最近一次: {plugin.SemiAutoAssistant.LastReceiveCaptureSummary}");
-
-        ImGui.Separator();
-        ImGui.Text("通用 API 測試");
-        var dbgAddon = configuration.SemiAutoDebugGenericAddon;
-        if (ImGui.InputText("Addon 名稱", ref dbgAddon, 64))
-        {
-            configuration.SemiAutoDebugGenericAddon = dbgAddon;
-            configuration.Save();
-        }
-
-        var dbgCount = configuration.SemiAutoDebugGenericCount;
-        if (ImGui.SliderInt("Count", ref dbgCount, 0, 5))
-        {
-            configuration.SemiAutoDebugGenericCount = dbgCount;
-            configuration.Save();
-        }
-
-        DrawGenericArgEditor("arg0", configuration.SemiAutoDebugGenericType0, configuration.SemiAutoDebugGenericValue0, (t, v) =>
-        {
-            configuration.SemiAutoDebugGenericType0 = t;
-            configuration.SemiAutoDebugGenericValue0 = v;
-        });
-        DrawGenericArgEditor("arg1", configuration.SemiAutoDebugGenericType1, configuration.SemiAutoDebugGenericValue1, (t, v) =>
-        {
-            configuration.SemiAutoDebugGenericType1 = t;
-            configuration.SemiAutoDebugGenericValue1 = v;
-        });
-        DrawGenericArgEditor("arg2", configuration.SemiAutoDebugGenericType2, configuration.SemiAutoDebugGenericValue2, (t, v) =>
-        {
-            configuration.SemiAutoDebugGenericType2 = t;
-            configuration.SemiAutoDebugGenericValue2 = v;
-        });
-        DrawGenericArgEditor("arg3", configuration.SemiAutoDebugGenericType3, configuration.SemiAutoDebugGenericValue3, (t, v) =>
-        {
-            configuration.SemiAutoDebugGenericType3 = t;
-            configuration.SemiAutoDebugGenericValue3 = v;
-        });
-        DrawGenericArgEditor("arg4", configuration.SemiAutoDebugGenericType4, configuration.SemiAutoDebugGenericValue4, (t, v) =>
-        {
-            configuration.SemiAutoDebugGenericType4 = t;
-            configuration.SemiAutoDebugGenericValue4 = v;
-        });
-
-        if (ImGui.Button("送出通用 callback"))
-        {
-            plugin.SemiAutoAssistant.DebugFireGenericCallback(
-                configuration.SemiAutoDebugGenericAddon,
-                configuration.SemiAutoDebugGenericCount,
-                configuration.SemiAutoDebugGenericType0, configuration.SemiAutoDebugGenericValue0,
-                configuration.SemiAutoDebugGenericType1, configuration.SemiAutoDebugGenericValue1,
-                configuration.SemiAutoDebugGenericType2, configuration.SemiAutoDebugGenericValue2,
-                configuration.SemiAutoDebugGenericType3, configuration.SemiAutoDebugGenericValue3,
-                configuration.SemiAutoDebugGenericType4, configuration.SemiAutoDebugGenericValue4);
-        }
-        ImGui.TextDisabled("Type: 3=Int, 4=UInt。先用通用捕捉拿到型別/值，再重播。");
-
         var detectRadius = configuration.NpcDetectRadius;
         if (ImGui.SliderFloat("NPC 判定半徑", ref detectRadius, 2f, 20f, "%.1f"))
         {
@@ -238,41 +147,5 @@ public class ConfigWindow : Window, IDisposable
 
         ImGui.Text("NPC A 座標請到主視窗抓取目標 NPC 設定。");
 
-        ImGui.TextWrapped(plugin.SemiAutoAssistant.StatusSummary);
-
-        if (ImGui.Button("開始監看對話"))
-        {
-            plugin.SemiAutoAssistant.Start();
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("停止"))
-        {
-            plugin.SemiAutoAssistant.Stop("使用者停止");
-        }
-
-    }
-
-    private void DrawGenericArgEditor(string label, int type, int value, Action<int, int> onChanged)
-    {
-        var localType = type;
-        var localValue = value;
-        var changed = false;
-
-        if (ImGui.InputInt($"{label} type", ref localType))
-        {
-            changed = true;
-        }
-        ImGui.SameLine();
-        if (ImGui.InputInt($"{label} value", ref localValue))
-        {
-            changed = true;
-        }
-
-        if (changed)
-        {
-            onChanged(localType, localValue);
-            configuration.Save();
-        }
     }
 }

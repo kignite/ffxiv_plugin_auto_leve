@@ -1,24 +1,19 @@
 ﻿using System;
 using System.Numerics;
-using ImGuiNET;
-using Dalamud.Interface.Textures;
-using Dalamud.Interface.Utility;
-using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
-using Lumina.Excel.Sheets;
+using ImGuiNET;
 
 namespace autoLeve.Windows;
 
 public class MainWindow : Window, IDisposable
 {
-    private readonly string goatImagePath;
     private readonly Plugin plugin;
 
     // We give this window a hidden ID using ##.
     // The user will see "My Amazing Window" as window title,
     // but for ImGui the ID is "My Amazing Window##With a hidden ID"
-    public MainWindow(Plugin plugin, string goatImagePath)
-        : base("My Amazing Window##With a hidden ID", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
+    public MainWindow(Plugin plugin)
+        : base("AutoLeve Control Panel##MainWindow", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
     {
         SizeConstraints = new WindowSizeConstraints
         {
@@ -26,7 +21,6 @@ public class MainWindow : Window, IDisposable
             MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
         };
 
-        this.goatImagePath = goatImagePath;
         this.plugin = plugin;
     }
 
@@ -34,109 +28,58 @@ public class MainWindow : Window, IDisposable
 
     public override void Draw()
     {
-        var player = Plugin.ClientState.LocalPlayer;
         var config = plugin.Configuration;
 
-        ImGui.Text("=== 玩家資訊 ===");
-
-        if (player == null)
-        {
-            ImGui.Text("尚未登入角色");
-        }
-        else
-        {
-            Vector3 p = player.Position;
-
-            ImGui.Text($"Territory: {Plugin.ClientState.TerritoryType}");
-            ImGui.Text($"玩家座標:");
-            ImGui.Text($"X: {p.X:F2}");
-            ImGui.Text($"Y: {p.Y:F2}");
-            ImGui.Text($"Z: {p.Z:F2}");
-        }
-
         ImGui.Separator();
+        ImGui.Text("=== 自動循環控制 ===");
+        ImGui.TextDisabled("attack1 = NPC A，attack2 = NPC B");
 
-        ImGui.Text("=== 目前目標 ===");
-
-        var target = Plugin.TargetManager.Target;
-
-        if (target == null)
+        if (ImGui.Button("標記目前目標為 attack1(NPC A)"))
         {
-            ImGui.Text("沒有目標");
+            plugin.SemiAutoAssistant.MarkCurrentTargetAttack1();
         }
-        else
+        ImGui.SameLine();
+        if (ImGui.Button("標記目前目標為 attack2(NPC B)"))
         {
-            var pos = target.Position;
-
-            ImGui.Text($"名稱: {target.Name}");
-            ImGui.Text($"X: {pos.X:F2}");
-            ImGui.Text($"Y: {pos.Y:F2}");
-            ImGui.Text($"Z: {pos.Z:F2}");
+            plugin.SemiAutoAssistant.MarkCurrentTargetAttack2();
         }
 
-        if (ImGui.Button("抓取目前目標 NPC"))
+        if (ImGui.Button("開始自動循環 (A↔B)"))
         {
-            if (target == null)
+            if (!config.SemiAutoTestFlowAEnabled || !config.SemiAutoTestFlowBEnabled)
             {
-                Plugin.ChatGui.Print("沒有目標");
+                config.SemiAutoTestFlowAEnabled = true;
+                config.SemiAutoTestFlowBEnabled = true;
+                config.Save();
             }
-            else
+            plugin.SemiAutoAssistant.Start();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("停止"))
+        {
+            plugin.SemiAutoAssistant.Stop("使用者停止");
+        }
+
+        var targetLeveName = config.SemiAutoTargetLeveName;
+        if (ImGui.InputText("目標理符名稱", ref targetLeveName, 128))
+        {
+            config.SemiAutoTargetLeveName = targetLeveName;
+            config.Save();
+        }
+
+        var targetTurnInCount = config.SemiAutoTargetTurnInCount;
+        if (ImGui.InputInt("目標繳交次數 (0=不限)", ref targetTurnInCount))
+        {
+            if (targetTurnInCount < 0)
             {
-                var pos = target.Position;
-
-                Plugin.ChatGui.Print(
-                    $"NPC: {target.Name} | " +
-                    $"Territory={Plugin.ClientState.TerritoryType} | " +
-                    $"X={pos.X:F2} Y={pos.Y:F2} Z={pos.Z:F2}"
-                );
-
-                Plugin.Log.Information(
-                    "NPC {Name} @ {Pos} territory={Territory}",
-                    target.Name.TextValue,
-                    pos,
-                    Plugin.ClientState.TerritoryType
-                );
+                targetTurnInCount = 0;
             }
+            config.SemiAutoTargetTurnInCount = targetTurnInCount;
+            config.Save();
         }
 
-        ImGui.Separator();
-        ImGui.Text("=== NPC 位置設定 ===");
-
-        if (ImGui.Button("設為 NPC A (接理符)"))
-        {
-            SaveNpcPoint(target);
-        }
-
-        if (config.NpcAConfigured)
-        {
-            ImGui.Text($"A: {config.NpcAName} @ T{config.NpcATerritory} ({config.NpcAX:F1},{config.NpcAY:F1},{config.NpcAZ:F1})");
-        }
-        else
-        {
-            ImGui.Text("A: 尚未設定");
-        }
+        ImGui.TextDisabled("目前僅支援舊薩雷安。使用前請先站在轉角並標記兩個 NPC。");
+        ImGui.TextDisabled("請先用「確認操作」手動提交一次高山茶（用於定位背包中的高山茶位置）。");
     }
 
-    private void SaveNpcPoint(Dalamud.Game.ClientState.Objects.Types.IGameObject? target)
-    {
-        if (target == null)
-        {
-            Plugin.ChatGui.Print("沒有目標");
-            return;
-        }
-
-        var config = plugin.Configuration;
-        var pos = target.Position;
-        var territory = Plugin.ClientState.TerritoryType;
-
-        config.NpcAConfigured = true;
-        config.NpcAName = target.Name.TextValue;
-        config.NpcATerritory = territory;
-        config.NpcAX = pos.X;
-        config.NpcAY = pos.Y;
-        config.NpcAZ = pos.Z;
-        Plugin.ChatGui.Print($"[autoLeve] 已設定 NPC A: {config.NpcAName}");
-
-        config.Save();
-    }
 }

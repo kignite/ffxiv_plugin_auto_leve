@@ -1,12 +1,14 @@
 {
-  "Author": "your name here",
+  "Author": "tsengleo",
   "Name": "autoLeve",
-  "Punchline": "A short one-liner that shows up in /xlplugins.",
-  "Description": "A description that shows up in /xlplugins. List any major slash-command(s).",
+  "Punchline": "Semi-auto A↔B leve pickup and turn-in loop for marked NPCs.",
+  "Description": "AutoLeve provides a semi-automatic crafting leve loop: target NPC A (attack1) to accept the configured leve, then target NPC B (attack2) to turn in items, and repeat until leve allowance is exhausted. Main controls are in the AutoLeve Control Panel. Slash command: /alevetest semi start|stop|status|dump.",
+  "IconUrl": "alien.png",
   "ApplicableVersion": "any",
   "Tags": [
-    "sample",
-    "plugin",
-    "goats"
+    "leve",
+    "crafting",
+    "automation",
+    "turn-in"
   ]
 }

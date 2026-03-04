@@ -17,6 +17,8 @@ public class Configuration : IPluginConfiguration
     public bool SemiAutoM3AutoAcceptLeve { get; set; } = true;
     public bool SemiAutoTestFlowAEnabled { get; set; } = true;
     public bool SemiAutoTestFlowBEnabled { get; set; } = false;
+    public bool SemiAutoBUseConfirmSpam { get; set; } = true;
+    public bool SemiAutoBUseKeyboardConfirmKey { get; set; } = true;
     public bool SemiAutoUseConfiguredGuildLeveSelectCallback { get; set; } = false;
     public int SemiAutoActionDelayMs { get; set; } = 900;
     public string SemiAutoTargetLeveName { get; set; } = "治癒身心的茶";
@@ -27,6 +29,7 @@ public class Configuration : IPluginConfiguration
     public int SemiAutoGuildLeveSelectArg0 { get; set; } = 13;
     public int SemiAutoGuildLeveSelectArg1 { get; set; } = 13;
     public int SemiAutoGuildLeveSelectLeveId { get; set; } = 1647;
+    public int SemiAutoTargetTurnInCount { get; set; } = 0; // 0 = unlimited
     public string SemiAutoDebugGenericAddon { get; set; } = "Request";
     public int SemiAutoDebugGenericCount { get; set; } = 4;
     public int SemiAutoDebugGenericType0 { get; set; } = 3; // Int
