@@ -24,6 +24,8 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
     [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
+    [PluginService] internal static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
+    [PluginService] internal static IAddonEventManager AddonEventManager { get; private set; } = null!;
 
     private const string CommandName = "/alevetest";
 
@@ -44,7 +46,9 @@ public sealed class Plugin : IDalamudPlugin
             Log,
             GameGui,
             ClientState,
-            GameInteropProvider);
+            GameInteropProvider,
+            AddonLifecycle,
+            AddonEventManager);
 
         // You might normally want to embed resources and load them from the manifest stream
         var goatImagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");

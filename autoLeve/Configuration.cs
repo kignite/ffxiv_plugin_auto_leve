@@ -21,9 +21,25 @@ public class Configuration : IPluginConfiguration
     public int SemiAutoActionDelayMs { get; set; } = 900;
     public string SemiAutoTargetLeveName { get; set; } = "治癒身心的茶";
     public int SemiAutoGuildLeveAcceptCallback { get; set; } = 1491;
+    public bool SemiAutoM34UseTwoArgCallback { get; set; } = false;
+    public int SemiAutoM34TwoArgCmd { get; set; } = 3;
+    public int SemiAutoM34TwoArgLeveId { get; set; } = 1647;
     public int SemiAutoGuildLeveSelectArg0 { get; set; } = 13;
     public int SemiAutoGuildLeveSelectArg1 { get; set; } = 13;
     public int SemiAutoGuildLeveSelectLeveId { get; set; } = 1647;
+    public string SemiAutoDebugGenericAddon { get; set; } = "Request";
+    public int SemiAutoDebugGenericCount { get; set; } = 4;
+    public int SemiAutoDebugGenericType0 { get; set; } = 3; // Int
+    public int SemiAutoDebugGenericValue0 { get; set; } = 2;
+    public int SemiAutoDebugGenericType1 { get; set; } = 4; // UInt
+    public int SemiAutoDebugGenericValue1 { get; set; } = 0;
+    public int SemiAutoDebugGenericType2 { get; set; } = 4; // UInt
+    public int SemiAutoDebugGenericValue2 { get; set; } = 44;
+    public int SemiAutoDebugGenericType3 { get; set; } = 4; // UInt
+    public int SemiAutoDebugGenericValue3 { get; set; } = 0;
+    public int SemiAutoDebugGenericType4 { get; set; } = 3; // Int
+    public int SemiAutoDebugGenericValue4 { get; set; } = 0;
+    public string SemiAutoReplayTargetAddon { get; set; } = "Request";
 
     public bool NpcAConfigured { get; set; } = true;
     public string NpcAName { get; set; } = "格里格";

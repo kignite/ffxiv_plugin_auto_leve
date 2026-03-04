@@ -1,76 +1,81 @@
-> ⚠️ **Don't click Fork!**
-> 
-> This is a GitHub Template repo. If you want to use this for a plugin, [use this template][new-repo] to make a new repo!
->
-> ![image](https://github.com/goatcorp/autoLeve/assets/16760685/d9732094-e1ed-4769-a70b-58ed2b92580c)
+# autoLeve (Semi-Auto Leve Assistant)
 
-# autoLeve
+This plugin is currently focused on a semi-automatic leve workflow:
+- Flow A: accept a target leve (M3-3 complete)
+- Flow B: turn-in flow (still under active validation)
 
-[![Use This Template badge](https://img.shields.io/badge/Use%20This%20Template-0?logo=github&labelColor=grey)][new-repo]
+## Current Status
 
+### Flow A
+- Implemented path:
+  - `Talk -> SelectString -> GuildLeve(select) -> Accept -> end interaction`
+- Supports explicit callback-based target selection
+- Supports M3-4 two-argument mode (`[cmd, leveId]`)
 
-Simple example plugin for Dalamud.
+### Flow B
+- State machine is in place:
+  - `Talk -> Request(select item) -> Request(submit) -> SelectYesno -> Talk -> JournalResult`
+- Main unstable area is still Step 2/3 (item selection and submit behavior)
 
-This is not designed to be the simplest possible example, but it is also not designed to cover everything you might want to do. For more detailed questions, come ask in [the Discord](https://discord.gg/holdshift).
+## Debug Tools (Config Window)
 
-## Main Points
+### 1) Callback Capture / Replay
+- `Record Next Action (Single)`
+  - Captures exactly one `FireCallback`
+- `Enable Generic Callback Capture`
+  - Continuous callback capture window
+- `Replay Last Captured`
+  - Replays the latest captured callback
+- `Replay Target Addon`
+  - Lets you override `(unknown)` captures with a visible addon name
 
-* Simple functional plugin
-  * Slash command
-  * Main UI
-  * Settings UI
-  * Image loading
-  * Plugin json
-* Simple, slightly-improved plugin configuration handling
-* Project organization
-  * Copies all necessary plugin files to the output directory
-    * Does not copy dependencies that are provided by dalamud
-    * Output directory can be zipped directly and have exactly what is required
-  * Hides data files from visual studio to reduce clutter
-    * Also allows having data files in different paths than VS would usually allow if done in the IDE directly
+### 2) UI Event (DragDrop/Click) Capture / Replay
+- `Record Next UI Event (Single)`
+  - Attempts to bind capture on:
+    - `Request`
+    - `RequestItem`
+    - `InventoryExpansion`
+  - Monitors drag/drop + click-oriented UI events
+- `Replay Last UI Event`
+  - Replays the latest captured UI event (`event type + param`)
 
+### 3) Apply Capture to Automation
+- `Apply Last Capture to B Item Select`
+  - Applies the latest callback capture to Flow B Step 2 selection logic
 
-The intention is less that any of this is used directly in other projects, and more to show how similar things can be done.
+## Recommended Test Procedure
 
-## How To Use
+### Test B Step 2 (Item Select)
+1. Open the turn-in screen (`Request` visible).
+2. Click `Record Next UI Event (Single)`.
+3. Manually do exactly one action: select the first item.
+4. Check `Last UI Event Capture`.
+5. Try `Replay Last UI Event`.
 
-### Getting Started
+### Test B Step 3 (Submit)
+1. Ensure Step 2 has successfully selected an item.
+2. Click `Record Next Action (Single)`.
+3. Manually press submit once.
+4. Verify callback capture and replay behavior.
 
-To begin, [clone this template repository][new-repo] to your own GitHub account. This will automatically bring in everything you need to get a jumpstart on development. You do not need to fork this repository unless you intend to contribute modifications to it.
+## Commands
+- `/alevetest semi on`
+- `/alevetest semi off`
+- `/alevetest semi start`
+- `/alevetest semi stop`
+- `/alevetest semi status`
+- `/alevetest semi dump`
 
-Be sure to also check out the [Dalamud Developer Docs][dalamud-docs] for helpful information about building your own plugin. The Developer Docs includes helpful information about all sorts of things, including [how to submit][submit] your newly-created plugin to the official repository. Assuming you use this template repository, the provided project build configuration and license are already chosen to make everything a breeze.
+## Build
 
-[new-repo]: https://github.com/new?template_name=autoLeve&template_owner=goatcorp
-[dalamud-docs]: https://dalamud.dev
-[submit]: https://dalamud.dev/plugin-publishing/submission
+```bash
+dotnet build autoLeve.sln
+```
 
-### Prerequisites
+Output DLL:
+- `autoLeve/bin/x64/Debug/autoLeve.dll`
 
-autoLeve assumes all the following prerequisites are met:
-
-* XIVLauncher, FINAL FANTASY XIV, and Dalamud have all been installed and the game has been run with Dalamud at least once.
-* XIVLauncher is installed to its default directories and configurations.
-  * If a custom path is required for Dalamud's dev directory, it must be set with the `DALAMUD_HOME` environment variable.
-* A .NET Core 8 SDK has been installed and configured, or is otherwise available. (In most cases, the IDE will take care of this.)
-
-### Building
-
-1. Open up `autoLeve.sln` in your C# editor of choice (likely [Visual Studio 2022](https://visualstudio.microsoft.com) or [JetBrains Rider](https://www.jetbrains.com/rider/)).
-2. Build the solution. By default, this will build a `Debug` build, but you can switch to `Release` in your IDE.
-3. The resulting plugin can be found at `autoLeve/bin/x64/Debug/autoLeve.dll` (or `Release` if appropriate.)
-
-### Activating in-game
-
-1. Launch the game and use `/xlsettings` in chat or `xlsettings` in the Dalamud Console to open up the Dalamud settings.
-    * In here, go to `Experimental`, and add the full path to the `autoLeve.dll` to the list of Dev Plugin Locations.
-2. Next, use `/xlplugins` (chat) or `xlplugins` (console) to open up the Plugin Installer.
-    * In here, go to `Dev Tools > Installed Dev Plugins`, and the `autoLeve` should be visible. Enable it.
-3. You should now be able to use `/pmycommand` (chat) or `pmycommand` (console)!
-
-Note that you only need to add it to the Dev Plugin Locations once (Step 1); it is preserved afterwards. You can disable, enable, or load your plugin on startup through the Plugin Installer.
-
-### Reconfiguring for your own uses
-
-Replace all references to `autoLeve` in all the files and filenames with your desired name, then start building the plugin of your dreams. You'll figure it out 😁
-
-Dalamud will load the JSON file (by default, `autoLeve/autoLeve.json`) next to your DLL and use it for metadata, including the description for your plugin in the Plugin Installer. Make sure to update this with information relevant to _your_ plugin!
+## Notes
+- `FireCallbackInt` is not a typical high-level Dalamud service API method. It is from `FFXIVClientStructs` (`AtkUnitBase`) convenience wrappers.
+- The same in-game action may go through callback or drag/drop event chains.
+  - This is why the plugin now provides both callback capture and UI event capture paths.

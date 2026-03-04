@@ -10,9 +10,6 @@ public class ConfigWindow : Window, IDisposable
 {
     private readonly Configuration configuration;
     private readonly Plugin plugin;
-    private int manualGuildLeveArg0 = 13;
-    private int manualGuildLeveArg1 = 13;
-    private int manualGuildLeveId = 1647;
 
     // We give this window a constant ID using ###.
     // This allows for labels to be dynamic, like "{FPS Counter}fps###XYZ counter window",
@@ -31,9 +28,6 @@ public class ConfigWindow : Window, IDisposable
 
         this.plugin = plugin;
         configuration = plugin.Configuration;
-        manualGuildLeveArg0 = configuration.SemiAutoGuildLeveSelectArg0;
-        manualGuildLeveArg1 = configuration.SemiAutoGuildLeveSelectArg1;
-        manualGuildLeveId = configuration.SemiAutoGuildLeveSelectLeveId;
     }
 
     public void Dispose() { }
@@ -140,43 +134,101 @@ public class ConfigWindow : Window, IDisposable
             configuration.Save();
         }
 
-        var guildAccept = configuration.SemiAutoGuildLeveAcceptCallback;
-        if (ImGui.SliderInt("GuildLeve 接受索引", ref guildAccept, 0, 2500))
+        ImGui.Separator();
+        ImGui.Text("流程捕捉");
+        if (ImGui.Button("記錄下一次操作(單步)"))
         {
-            configuration.SemiAutoGuildLeveAcceptCallback = guildAccept;
+            plugin.SemiAutoAssistant.ArmSingleStepCapture();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("記錄下一次UI事件(單步)"))
+        {
+            plugin.SemiAutoAssistant.ArmSingleReceiveEventCapture();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("啟用通用 callback 捕捉"))
+        {
+            plugin.SemiAutoAssistant.ArmAnyCallbackCaptureOnce();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("套用最近捕捉為B選物"))
+        {
+            plugin.SemiAutoAssistant.ApplyLastCapturedCallbackToBSelect();
+        }
+        var replayAddon = configuration.SemiAutoReplayTargetAddon;
+        if (ImGui.InputText("重播目標addon(留空=記錄addon)", ref replayAddon, 64))
+        {
+            configuration.SemiAutoReplayTargetAddon = replayAddon;
+            configuration.Save();
+        }
+        if (ImGui.Button("重播剛剛記錄"))
+        {
+            plugin.SemiAutoAssistant.ReplayLastCapturedCallback(configuration.SemiAutoReplayTargetAddon);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("重播剛剛UI事件"))
+        {
+            plugin.SemiAutoAssistant.ReplayLastReceiveEvent(configuration.SemiAutoReplayTargetAddon);
+        }
+        ImGui.TextDisabled("先用通用捕捉記錄手動選物，再套用到 B 自動選物。");
+        ImGui.TextWrapped($"通用捕捉最近一次: {plugin.SemiAutoAssistant.LastGenericCaptureSummary}");
+        ImGui.TextWrapped($"UI事件捕捉最近一次: {plugin.SemiAutoAssistant.LastReceiveCaptureSummary}");
+
+        ImGui.Separator();
+        ImGui.Text("通用 API 測試");
+        var dbgAddon = configuration.SemiAutoDebugGenericAddon;
+        if (ImGui.InputText("Addon 名稱", ref dbgAddon, 64))
+        {
+            configuration.SemiAutoDebugGenericAddon = dbgAddon;
             configuration.Save();
         }
 
-        ImGui.Separator();
-        ImGui.Text("GuildLeve callback 捕捉");
-        if (ImGui.Button("啟用 callback 捕捉"))
+        var dbgCount = configuration.SemiAutoDebugGenericCount;
+        if (ImGui.SliderInt("Count", ref dbgCount, 0, 5))
         {
-            plugin.SemiAutoAssistant.ArmGuildLeveCallbackCaptureOnce();
+            configuration.SemiAutoDebugGenericCount = dbgCount;
+            configuration.Save();
         }
-        ImGui.TextDisabled("按下後請手動點選理符，查看 /xllog 的 hook 輸出。");
-        if (ImGui.Button("啟用 B callback 捕捉"))
+
+        DrawGenericArgEditor("arg0", configuration.SemiAutoDebugGenericType0, configuration.SemiAutoDebugGenericValue0, (t, v) =>
         {
-            plugin.SemiAutoAssistant.ArmNpcBCallbackCaptureOnce();
-        }
-        ImGui.TextDisabled("按下後請在交貨流程手動按一次確認鍵(NUM0)，查看 /xllog 的 hook 輸出。");
-        ImGui.SetNextItemWidth(80f);
-        ImGui.InputInt("arg0", ref manualGuildLeveArg0);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(80f);
-        ImGui.InputInt("arg1", ref manualGuildLeveArg1);
-        ImGui.SetNextItemWidth(120f);
-        ImGui.InputInt("leveId", ref manualGuildLeveId);
-        if (ImGui.Button("測試並同步到自動M3-3"))
+            configuration.SemiAutoDebugGenericType0 = t;
+            configuration.SemiAutoDebugGenericValue0 = v;
+        });
+        DrawGenericArgEditor("arg1", configuration.SemiAutoDebugGenericType1, configuration.SemiAutoDebugGenericValue1, (t, v) =>
         {
-            plugin.SemiAutoAssistant.DebugSelectGuildLeveByCallbackArgs(
-                manualGuildLeveArg0,
-                manualGuildLeveArg1,
-                manualGuildLeveId);
-            plugin.SemiAutoAssistant.ApplyGuildLeveSelectCallbackToAuto(
-                manualGuildLeveArg0,
-                manualGuildLeveArg1,
-                manualGuildLeveId);
+            configuration.SemiAutoDebugGenericType1 = t;
+            configuration.SemiAutoDebugGenericValue1 = v;
+        });
+        DrawGenericArgEditor("arg2", configuration.SemiAutoDebugGenericType2, configuration.SemiAutoDebugGenericValue2, (t, v) =>
+        {
+            configuration.SemiAutoDebugGenericType2 = t;
+            configuration.SemiAutoDebugGenericValue2 = v;
+        });
+        DrawGenericArgEditor("arg3", configuration.SemiAutoDebugGenericType3, configuration.SemiAutoDebugGenericValue3, (t, v) =>
+        {
+            configuration.SemiAutoDebugGenericType3 = t;
+            configuration.SemiAutoDebugGenericValue3 = v;
+        });
+        DrawGenericArgEditor("arg4", configuration.SemiAutoDebugGenericType4, configuration.SemiAutoDebugGenericValue4, (t, v) =>
+        {
+            configuration.SemiAutoDebugGenericType4 = t;
+            configuration.SemiAutoDebugGenericValue4 = v;
+        });
+
+        if (ImGui.Button("送出通用 callback"))
+        {
+            plugin.SemiAutoAssistant.DebugFireGenericCallback(
+                configuration.SemiAutoDebugGenericAddon,
+                configuration.SemiAutoDebugGenericCount,
+                configuration.SemiAutoDebugGenericType0, configuration.SemiAutoDebugGenericValue0,
+                configuration.SemiAutoDebugGenericType1, configuration.SemiAutoDebugGenericValue1,
+                configuration.SemiAutoDebugGenericType2, configuration.SemiAutoDebugGenericValue2,
+                configuration.SemiAutoDebugGenericType3, configuration.SemiAutoDebugGenericValue3,
+                configuration.SemiAutoDebugGenericType4, configuration.SemiAutoDebugGenericValue4);
         }
+        ImGui.TextDisabled("Type: 3=Int, 4=UInt。先用通用捕捉拿到型別/值，再重播。");
+
         var detectRadius = configuration.NpcDetectRadius;
         if (ImGui.SliderFloat("NPC 判定半徑", ref detectRadius, 2f, 20f, "%.1f"))
         {
@@ -199,10 +251,28 @@ public class ConfigWindow : Window, IDisposable
             plugin.SemiAutoAssistant.Stop("使用者停止");
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button("Dump 目前選單"))
+    }
+
+    private void DrawGenericArgEditor(string label, int type, int value, Action<int, int> onChanged)
+    {
+        var localType = type;
+        var localValue = value;
+        var changed = false;
+
+        if (ImGui.InputInt($"{label} type", ref localType))
         {
-            plugin.SemiAutoAssistant.DumpVisibleMenuEntries();
+            changed = true;
+        }
+        ImGui.SameLine();
+        if (ImGui.InputInt($"{label} value", ref localValue))
+        {
+            changed = true;
+        }
+
+        if (changed)
+        {
+            onChanged(localType, localValue);
+            configuration.Save();
         }
     }
 }

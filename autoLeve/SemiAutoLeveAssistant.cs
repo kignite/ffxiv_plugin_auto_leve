@@ -1,4 +1,7 @@
 using Dalamud.Hooking;
+using Dalamud.Game.Addon.Events;
+using Dalamud.Game.Addon.Lifecycle;
+using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using System.Numerics;
@@ -25,10 +28,29 @@ public enum NpcAStep
     AwaitSelectString,
     AwaitGuildLeveSelect,
     AwaitGuildLeveAccept,
+    AwaitNpcAInteractionEnd,
+}
+
+public enum NpcBStep
+{
+    AwaitTalkStart,
+    AwaitRequestSelectItem,
+    AwaitRequestSubmit,
+    AwaitConfirmYesno,
+    AwaitTalkAfterSubmit,
+    AwaitJournalResult,
 }
 
 public sealed class SemiAutoLeveAssistant : IDisposable
 {
+    private const int GuildLeveAcceptTransitionTimeoutMs = 1800;
+
+    private enum GuildLeveCaptureMode
+    {
+        Any,
+        AcceptOnly,
+    }
+
     private const int GuildLeveLevelCellMaxLookahead = 8;
 
     private static readonly string[] WatchedAddonNames =
@@ -39,8 +61,22 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         "SelectYesno",
         "Request",
         "RequestItem",
+        "InventoryExpansion",
         "Talk",
         "JournalResult",
+    ];
+
+    private static readonly AddonEventType[] CaptureEventTypes =
+    [
+        AddonEventType.DragDropBegin,
+        AddonEventType.DragDropInsert,
+        AddonEventType.DragDropEnd,
+        AddonEventType.DragDropRollOver,
+        AddonEventType.DragDropRollOut,
+        AddonEventType.DragDropCancel,
+        AddonEventType.MouseClick,
+        AddonEventType.ListItemClick,
+        AddonEventType.ButtonClick,
     ];
 
     private readonly Configuration configuration;
@@ -48,6 +84,8 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     private readonly IPluginLog log;
     private readonly IGameGui gameGui;
     private readonly IClientState clientState;
+    private readonly IAddonLifecycle addonLifecycle;
+    private readonly IAddonEventManager addonEventManager;
     private readonly Hook<AtkUnitBase.Delegates.FireCallback> fireCallbackHook;
 
     private string? lastDetectedAddon;
@@ -62,16 +100,48 @@ public sealed class SemiAutoLeveAssistant : IDisposable
     private DateTime lastConfiguredGuildLeveCallbackAtUtc;
     private DateTime lastGuildLeveSelectCallbackAtUtc;
     private string? guildLeveTitleBeforeSelectCallback;
+    private DateTime lastGuildLeveAcceptActionAtUtc;
+    private int guildLeveAcceptRetryStage;
+    private bool guildLeveExitAfterAcceptSent;
+    private DateTime lastGuildLeveExitActionAtUtc;
     private bool waitingForNpcBTurnIn;
+    private NpcBStep npcBStep = NpcBStep.AwaitTalkStart;
     private bool npcBTurnInHadInteraction;
     private DateTime npcBTurnInStartedAtUtc;
     private DateTime npcBTurnInLastInteractionAtUtc;
     private bool guildLeveCallbackCaptureArmed;
     private int guildLeveCallbackCaptureRemaining;
     private DateTime guildLeveCallbackCaptureUntilUtc;
+    private GuildLeveCaptureMode guildLeveCaptureMode = GuildLeveCaptureMode.Any;
     private bool npcBCallbackCaptureArmed;
     private int npcBCallbackCaptureRemaining;
     private DateTime npcBCallbackCaptureUntilUtc;
+    private bool anyCallbackCaptureArmed;
+    private int anyCallbackCaptureRemaining;
+    private DateTime anyCallbackCaptureUntilUtc;
+    private bool anyCallbackCaptureSawData;
+    private string lastGenericCaptureSummary = "(none)";
+    private bool anyReceiveCaptureArmed;
+    private int anyReceiveCaptureRemaining;
+    private DateTime anyReceiveCaptureUntilUtc;
+    private bool anyReceiveCaptureSawData;
+    private string lastReceiveCaptureSummary = "(none)";
+    private string? lastReceiveAddonName;
+    private int lastReceiveEventType;
+    private int lastReceiveEventParam;
+    private readonly List<IAddonEventHandle> addonEventCaptureHandles = new();
+    private nint addonEventCaptureAddonPtr;
+    private string? addonEventCaptureAddonName;
+    private bool flowDiagnosticCaptureArmed;
+    private int flowDiagnosticCaptureRemaining;
+    private DateTime flowDiagnosticCaptureUntilUtc;
+    private string? lastCapturedAddonName;
+    private int lastCapturedCount;
+    private CapturedAtkValue[] lastCapturedValues = new CapturedAtkValue[8];
+    private bool bUseLearnedSelectCallback;
+    private string? bLearnedSelectAddonName;
+    private int bLearnedSelectCount;
+    private CapturedAtkValue[] bLearnedSelectValues = new CapturedAtkValue[8];
 
     public SemiAutoLeveState State { get; private set; } = SemiAutoLeveState.Idle;
     public bool IsArmed { get; private set; }
@@ -82,26 +152,36 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         IPluginLog log,
         IGameGui gameGui,
         IClientState clientState,
-        IGameInteropProvider gameInteropProvider)
+        IGameInteropProvider gameInteropProvider,
+        IAddonLifecycle addonLifecycle,
+        IAddonEventManager addonEventManager)
     {
         this.configuration = configuration;
         this.chatGui = chatGui;
         this.log = log;
         this.gameGui = gameGui;
         this.clientState = clientState;
+        this.addonLifecycle = addonLifecycle;
+        this.addonEventManager = addonEventManager;
         fireCallbackHook = gameInteropProvider.HookFromAddress<AtkUnitBase.Delegates.FireCallback>(
             (nint)AtkUnitBase.MemberFunctionPointers.FireCallback,
             OnFireCallbackDetour);
         fireCallbackHook.Enable();
+        addonLifecycle.RegisterListener(AddonEvent.PreReceiveEvent, OnAddonPreReceiveEvent);
     }
+
+    public string LastGenericCaptureSummary => lastGenericCaptureSummary;
+    public string LastReceiveCaptureSummary => lastReceiveCaptureSummary;
 
     public void Dispose()
     {
+        addonLifecycle.UnregisterListener(AddonEvent.PreReceiveEvent, OnAddonPreReceiveEvent);
+        ClearAddonEventCaptureHandles();
         fireCallbackHook.Dispose();
     }
 
     public string StatusSummary =>
-        $"Enabled={configuration.SemiAutoLeveEnabled}, TestA={configuration.SemiAutoTestFlowAEnabled}, TestB={configuration.SemiAutoTestFlowBEnabled}, Mode={lastMode}, AStep={npcAStep}, BWaiting={waitingForNpcBTurnIn}, Talk={configuration.SemiAutoM3AutoAdvanceTalk}, Menu2={configuration.SemiAutoM3AutoSelectStringFirstOption}, Target={configuration.SemiAutoTargetLeveName}, ForceCb=[{configuration.SemiAutoGuildLeveSelectArg0},{configuration.SemiAutoGuildLeveSelectArg1},{configuration.SemiAutoGuildLeveSelectLeveId}], Armed={IsArmed}, State={State}" +
+        $"Enabled={configuration.SemiAutoLeveEnabled}, TestA={configuration.SemiAutoTestFlowAEnabled}, TestB={configuration.SemiAutoTestFlowBEnabled}, Mode={lastMode}, AStep={npcAStep}, BWaiting={waitingForNpcBTurnIn}, BStep={npcBStep}, Talk={configuration.SemiAutoM3AutoAdvanceTalk}, Menu2={configuration.SemiAutoM3AutoSelectStringFirstOption}, Target={configuration.SemiAutoTargetLeveName}, ForceCb=[{configuration.SemiAutoGuildLeveSelectArg0},{configuration.SemiAutoGuildLeveSelectArg1},{configuration.SemiAutoGuildLeveSelectLeveId}], M34TwoArg={configuration.SemiAutoM34UseTwoArgCallback}[{configuration.SemiAutoM34TwoArgCmd},{configuration.SemiAutoM34TwoArgLeveId}], Armed={IsArmed}, State={State}" +
         (lastDetectedAddon is null ? string.Empty : $", LastAddon={lastDetectedAddon}");
 
     public void Start()
@@ -133,7 +213,12 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         guildLeveNoProgressCount = 0;
         lastGuildLeveSelectCallbackAtUtc = DateTime.MinValue;
         guildLeveTitleBeforeSelectCallback = null;
+        lastGuildLeveAcceptActionAtUtc = DateTime.MinValue;
+        guildLeveAcceptRetryStage = 0;
+        guildLeveExitAfterAcceptSent = false;
+        lastGuildLeveExitActionAtUtc = DateTime.MinValue;
         waitingForNpcBTurnIn = false;
+        npcBStep = NpcBStep.AwaitTalkStart;
         npcBTurnInHadInteraction = false;
         npcBTurnInStartedAtUtc = DateTime.MinValue;
         npcBTurnInLastInteractionAtUtc = DateTime.MinValue;
@@ -141,6 +226,7 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         if (!configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
         {
             waitingForNpcBTurnIn = true;
+            npcBStep = NpcBStep.AwaitTalkStart;
             npcBTurnInStartedAtUtc = DateTime.UtcNow;
             npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
         }
@@ -174,7 +260,12 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         guildLeveNoProgressCount = 0;
         lastGuildLeveSelectCallbackAtUtc = DateTime.MinValue;
         guildLeveTitleBeforeSelectCallback = null;
+        lastGuildLeveAcceptActionAtUtc = DateTime.MinValue;
+        guildLeveAcceptRetryStage = 0;
+        guildLeveExitAfterAcceptSent = false;
+        lastGuildLeveExitActionAtUtc = DateTime.MinValue;
         waitingForNpcBTurnIn = false;
+        npcBStep = NpcBStep.AwaitTalkStart;
         npcBTurnInHadInteraction = false;
         npcBTurnInStartedAtUtc = DateTime.MinValue;
         npcBTurnInLastInteractionAtUtc = DateTime.MinValue;
@@ -204,7 +295,17 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         guildLeveCallbackCaptureArmed = true;
         guildLeveCallbackCaptureRemaining = 30;
         guildLeveCallbackCaptureUntilUtc = DateTime.UtcNow.AddSeconds(10);
+        guildLeveCaptureMode = GuildLeveCaptureMode.Any;
         chatGui.Print("[autoLeve] 已啟用 GuildLeve callback 捕捉，請手動點一次目標理符。");
+    }
+
+    public void ArmGuildLeveAcceptCallbackCaptureOnce()
+    {
+        guildLeveCallbackCaptureArmed = true;
+        guildLeveCallbackCaptureRemaining = 30;
+        guildLeveCallbackCaptureUntilUtc = DateTime.UtcNow.AddSeconds(12);
+        guildLeveCaptureMode = GuildLeveCaptureMode.AcceptOnly;
+        chatGui.Print("[autoLeve] 已啟用 M3-4 接受 callback 捕捉，請手動點一次「接受」。");
     }
 
     public void ArmNpcBCallbackCaptureOnce()
@@ -213,6 +314,134 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         npcBCallbackCaptureRemaining = 50;
         npcBCallbackCaptureUntilUtc = DateTime.UtcNow.AddSeconds(20);
         chatGui.Print("[autoLeve] 已啟用 B 流程 callback 捕捉，請在交貨流程手動按一次確認鍵(NUM0)。");
+    }
+
+    public void ArmAnyCallbackCaptureOnce()
+    {
+        anyCallbackCaptureArmed = true;
+        anyCallbackCaptureRemaining = 80;
+        anyCallbackCaptureUntilUtc = DateTime.UtcNow.AddSeconds(15);
+        anyCallbackCaptureSawData = false;
+        chatGui.Print("[autoLeve] 已啟用通用 callback 捕捉，請手動點擊你要測試的按鈕。");
+    }
+
+    public void ArmSingleStepCapture()
+    {
+        anyCallbackCaptureArmed = true;
+        anyCallbackCaptureRemaining = 1;
+        anyCallbackCaptureUntilUtc = DateTime.UtcNow.AddSeconds(10);
+        anyCallbackCaptureSawData = false;
+        chatGui.Print("[autoLeve] 單步捕捉已啟用：請手動做一次操作。");
+    }
+
+    public void ArmSingleReceiveEventCapture()
+    {
+        anyReceiveCaptureArmed = true;
+        anyReceiveCaptureRemaining = 1;
+        anyReceiveCaptureUntilUtc = DateTime.UtcNow.AddSeconds(10);
+        anyReceiveCaptureSawData = false;
+        lastReceiveCaptureSummary = "(none)";
+        lastReceiveAddonName = null;
+        lastReceiveEventType = 0;
+        lastReceiveEventParam = 0;
+        ClearAddonEventCaptureHandles();
+        TryAttachAddonEventCapture();
+        chatGui.Print("[autoLeve] 單步 ReceiveEvent 捕捉已啟用：請手動做一次操作。");
+    }
+
+    public void ReplayLastCapturedCallback(string? targetAddonOverride)
+    {
+        if (lastCapturedCount <= 0)
+        {
+            chatGui.Print("[autoLeve] 尚未有可重播的捕捉資料。");
+            return;
+        }
+
+        var addonName = string.IsNullOrWhiteSpace(targetAddonOverride)
+            ? lastCapturedAddonName
+            : targetAddonOverride.Trim();
+
+        if (string.IsNullOrWhiteSpace(addonName) || addonName == "(unknown)")
+        {
+            chatGui.Print("[autoLeve] 重播失敗：請填入可見 addon 名稱（例如 Request）。");
+            return;
+        }
+
+        var addonPtr = gameGui.GetAddonByName(addonName);
+        if (!TryFireCapturedCallback(addonPtr, lastCapturedCount, lastCapturedValues))
+        {
+            chatGui.Print($"[autoLeve] 重播失敗：addon \"{addonName}\" 不可見或不可用。");
+            return;
+        }
+
+        chatGui.Print($"[autoLeve] 已重播捕捉 callback 到 addon=\"{addonName}\"，count={lastCapturedCount}");
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            log.Warning(
+                "Semi-auto leve debug replay: targetAddon={Addon}, fromCapturedAddon={CapturedAddon}, count={Count}",
+                addonName,
+                lastCapturedAddonName ?? "(none)",
+                lastCapturedCount);
+        }
+    }
+
+    public unsafe void ReplayLastReceiveEvent(string? targetAddonOverride)
+    {
+        if (lastReceiveEventType <= 0)
+        {
+            chatGui.Print("[autoLeve] 尚未有可重播的 ReceiveEvent 資料。");
+            return;
+        }
+
+        var addonName = string.IsNullOrWhiteSpace(targetAddonOverride)
+            ? lastReceiveAddonName
+            : targetAddonOverride.Trim();
+
+        if (string.IsNullOrWhiteSpace(addonName) || addonName == "(unknown)")
+        {
+            chatGui.Print("[autoLeve] ReceiveEvent 重播失敗：請填入可見 addon 名稱（例如 Request）。");
+            return;
+        }
+
+        var addonPtr = gameGui.GetAddonByName(addonName);
+        if (addonPtr == nint.Zero)
+        {
+            chatGui.Print($"[autoLeve] ReceiveEvent 重播失敗：找不到 addon \"{addonName}\"。");
+            return;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            chatGui.Print($"[autoLeve] ReceiveEvent 重播失敗：addon \"{addonName}\" 不可見。");
+            return;
+        }
+
+        unitBase->ReceiveEvent((AtkEventType)lastReceiveEventType, lastReceiveEventParam, null, null);
+        chatGui.Print($"[autoLeve] 已重播 ReceiveEvent：addon={addonName}, type={lastReceiveEventType}, param={lastReceiveEventParam}");
+    }
+
+    public void ArmFlowDiagnosticCaptureOnce()
+    {
+        flowDiagnosticCaptureArmed = true;
+        flowDiagnosticCaptureRemaining = 150;
+        flowDiagnosticCaptureUntilUtc = DateTime.UtcNow.AddSeconds(25);
+        chatGui.Print("[autoLeve] 已啟用流程診斷捕捉(A/B)，請完整操作一次你要測的按鈕流程。");
+    }
+
+    public void ApplyLastCapturedCallbackToBSelect()
+    {
+        if (string.IsNullOrWhiteSpace(lastCapturedAddonName) || lastCapturedCount <= 0)
+        {
+            chatGui.Print("[autoLeve] 尚無可套用捕捉資料。");
+            return;
+        }
+
+        bUseLearnedSelectCallback = true;
+        bLearnedSelectAddonName = lastCapturedAddonName;
+        bLearnedSelectCount = Math.Min(lastCapturedCount, bLearnedSelectValues.Length);
+        Array.Copy(lastCapturedValues, bLearnedSelectValues, bLearnedSelectCount);
+        chatGui.Print($"[autoLeve] 已套用最近捕捉為 B 選物：addon={bLearnedSelectAddonName}, count={bLearnedSelectCount}");
     }
 
     public unsafe void DebugSelectGuildLeveByCallbackArgs(int arg0, int arg1, int leveId)
@@ -266,8 +495,154 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         chatGui.Print($"[autoLeve] 已套用到自動 M3-3：[{arg0},{arg1},{leveId}]");
     }
 
+    public unsafe void DebugAcceptGuildLeveByTwoArgCallback(int cmd, int leveId)
+    {
+        if (leveId <= 0)
+        {
+            chatGui.Print("[autoLeve] M3-4 leveId 必須大於 0。");
+            return;
+        }
+
+        var addonPtr = gameGui.GetAddonByName("GuildLeve");
+        if (!TryFireGuildLeveTwoArgCallback(addonPtr, cmd, leveId))
+        {
+            chatGui.Print("[autoLeve] M3-4 測試失敗：找不到可見 GuildLeve 視窗。");
+            return;
+        }
+
+        chatGui.Print($"[autoLeve] 已送出 M3-4 2參數 callback: [{cmd},{leveId}]");
+    }
+
+    public void DebugBRequestSelectFirstItem()
+    {
+        if (TryFireDebugRequestCallback(4))
+        {
+            chatGui.Print("[autoLeve] 手動B測試：已送出 Request callback 4（選第一格）");
+        }
+        else
+        {
+            chatGui.Print("[autoLeve] 手動B測試失敗：找不到可見 Request/RequestItem 視窗。");
+        }
+    }
+
+    public void DebugBRequestSubmit()
+    {
+        if (TryFireDebugRequestCallback(0))
+        {
+            chatGui.Print("[autoLeve] 手動B測試：已送出 Request callback 0（提交）");
+        }
+        else
+        {
+            chatGui.Print("[autoLeve] 手動B測試失敗：找不到可見 Request/RequestItem 視窗。");
+        }
+    }
+
+    public void DebugBTalkAdvance()
+    {
+        var talkPtr = gameGui.GetAddonByName("Talk");
+        if (TryFireCallbackEmpty(talkPtr))
+        {
+            chatGui.Print("[autoLeve] 手動B測試：已送出 Talk empty callback。");
+            return;
+        }
+
+        chatGui.Print("[autoLeve] 手動B測試失敗：找不到可見 Talk 視窗。");
+    }
+
+    public unsafe void DebugBRequestCallback4Arg(uint a0, uint a1, uint a2, uint a3)
+    {
+        foreach (var addonName in new[] { "Request", "RequestItem" })
+        {
+            var addonPtr = gameGui.GetAddonByName(addonName);
+            if (TryFireRequestFourArgCallback(addonPtr, a0, a1, a2, a3))
+            {
+                chatGui.Print($"[autoLeve] 手動B測試：已送出 {addonName} callback4 [{a0},{a1},{a2},{a3}]");
+                if (configuration.SemiAutoVerboseLogging)
+                {
+                    log.Information("Semi-auto leve debug B: {Addon} callback4 [{A0},{A1},{A2},{A3}]", addonName, a0, a1, a2, a3);
+                }
+                return;
+            }
+        }
+
+        chatGui.Print("[autoLeve] 手動B測試失敗：找不到可見 Request/RequestItem 視窗。");
+    }
+
+    public unsafe void DebugFireGenericCallback(
+        string addonName,
+        int count,
+        int t0, int v0,
+        int t1, int v1,
+        int t2, int v2,
+        int t3, int v3,
+        int t4, int v4)
+    {
+        if (string.IsNullOrWhiteSpace(addonName))
+        {
+            chatGui.Print("[autoLeve] 通用 callback 失敗：addon 名稱為空。");
+            return;
+        }
+
+        var clampedCount = Math.Clamp(count, 0, 5);
+        var addonPtr = gameGui.GetAddonByName(addonName);
+        if (addonPtr == nint.Zero)
+        {
+            chatGui.Print($"[autoLeve] 通用 callback 失敗：找不到 addon \"{addonName}\"。");
+            return;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            chatGui.Print($"[autoLeve] 通用 callback 失敗：addon \"{addonName}\" 不可見。");
+            return;
+        }
+
+        var values = stackalloc AtkValue[5];
+        FillGenericAtkValue(values, 0, t0, v0);
+        FillGenericAtkValue(values, 1, t1, v1);
+        FillGenericAtkValue(values, 2, t2, v2);
+        FillGenericAtkValue(values, 3, t3, v3);
+        FillGenericAtkValue(values, 4, t4, v4);
+        unitBase->FireCallback((uint)clampedCount, values, true);
+
+        chatGui.Print($"[autoLeve] 通用 callback 已送出：addon={addonName}, count={clampedCount}");
+        if (configuration.SemiAutoVerboseLogging)
+        {
+            log.Warning(
+                "Semi-auto leve debug generic fire: addon={Addon}, count={Count}, a0=({T0},{V0}), a1=({T1},{V1}), a2=({T2},{V2}), a3=({T3},{V3}), a4=({T4},{V4})",
+                addonName,
+                clampedCount,
+                t0, v0,
+                t1, v1,
+                t2, v2,
+                t3, v3,
+                t4, v4);
+        }
+    }
+
+    public void ApplyGuildLeveAcceptTwoArgToAuto(int cmd, int leveId)
+    {
+        if (leveId <= 0)
+        {
+            chatGui.Print("[autoLeve] 無法套用 M3-4：leveId 必須大於 0。");
+            return;
+        }
+
+        configuration.SemiAutoM34UseTwoArgCallback = true;
+        configuration.SemiAutoM34TwoArgCmd = cmd;
+        configuration.SemiAutoM34TwoArgLeveId = leveId;
+        configuration.Save();
+        chatGui.Print($"[autoLeve] 已套用到自動 M3-4：[{cmd},{leveId}]");
+    }
+
     public void Update()
     {
+        if (anyReceiveCaptureArmed)
+        {
+            TryAttachAddonEventCapture();
+        }
+
         if (!configuration.SemiAutoLeveEnabled)
         {
             if (IsArmed || State != SemiAutoLeveState.Idle)
@@ -294,6 +669,12 @@ public sealed class SemiAutoLeveAssistant : IDisposable
 
         if (detected is null)
         {
+            if (npcAStep == NpcAStep.AwaitNpcAInteractionEnd && guildLeveAcceptRetryStage > 0)
+            {
+                CompleteAFlowAfterAccept();
+                return;
+            }
+
             if (waitingForNpcBTurnIn &&
                 npcBTurnInHadInteraction &&
                 (DateTime.UtcNow - npcBTurnInLastInteractionAtUtc).TotalMilliseconds > 1200)
@@ -351,22 +732,186 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             return;
         }
 
-        if (!TryFireCallbackInt(addonPtr, 0))
+        switch (npcBStep)
         {
-            return;
+            case NpcBStep.AwaitTalkStart:
+                if (detectedAddon == "Talk")
+                {
+                    if (TryFireCallbackEmpty(addonPtr))
+                    {
+                        MarkNpcBAction(detectedAddon, "empty", NpcBStep.AwaitRequestSelectItem);
+                    }
+                }
+                else if (detectedAddon == "Request")
+                {
+                    npcBStep = NpcBStep.AwaitRequestSelectItem;
+                }
+                break;
+
+            case NpcBStep.AwaitRequestSelectItem:
+                if (TryFireLearnedBSelectCallback())
+                {
+                    MarkNpcBAction(bLearnedSelectAddonName ?? "Request", "learned", NpcBStep.AwaitRequestSubmit);
+                }
+                else if (detectedAddon == "Request" && TryFireRequestSelectFirstSlot(addonPtr))
+                {
+                    // 依 flowdiag：Request 選第一格常見 4 參數 callback [2,0,44,0]
+                    MarkNpcBAction(detectedAddon, "[2,0,44,0]", NpcBStep.AwaitRequestSubmit);
+                }
+                else if (detectedAddon == "Request" && TryFireCallbackInt(addonPtr, 4))
+                {
+                    // 舊版 fallback：某些環境可用 int 4 選第一格。
+                    MarkNpcBAction(detectedAddon, "4", NpcBStep.AwaitRequestSubmit);
+                }
+                break;
+
+            case NpcBStep.AwaitRequestSubmit:
+                if (detectedAddon == "Request" && TryFireCallbackInt(addonPtr, 0))
+                {
+                    MarkNpcBAction(detectedAddon, "0", NpcBStep.AwaitConfirmYesno);
+                }
+                break;
+
+            case NpcBStep.AwaitConfirmYesno:
+                if (detectedAddon == "SelectYesno" && TryFireCallbackInt(addonPtr, 0))
+                {
+                    MarkNpcBAction(detectedAddon, "0", NpcBStep.AwaitTalkAfterSubmit);
+                }
+                else if (detectedAddon == "Talk")
+                {
+                    // 部分流程不會彈 SelectYesno，提交後直接回 Talk。
+                    npcBStep = NpcBStep.AwaitTalkAfterSubmit;
+                    if (configuration.SemiAutoVerboseLogging)
+                    {
+                        log.Information("Semi-auto leve B action: skip SelectYesno, continue with Talk");
+                    }
+                }
+                break;
+
+            case NpcBStep.AwaitTalkAfterSubmit:
+                if (detectedAddon == "Talk" && TryFireCallbackEmpty(addonPtr))
+                {
+                    MarkNpcBAction(detectedAddon, "empty", NpcBStep.AwaitJournalResult);
+                }
+                else if (detectedAddon == "JournalResult")
+                {
+                    npcBStep = NpcBStep.AwaitJournalResult;
+                }
+                break;
+
+            case NpcBStep.AwaitJournalResult:
+                if (detectedAddon == "JournalResult" && TryFireCallbackInt(addonPtr, 0))
+                {
+                    MarkNpcBAction(detectedAddon, "0", NpcBStep.AwaitJournalResult);
+                    Stop("B 流程完成（JournalResult）");
+                }
+                break;
+        }
+    }
+
+    private unsafe bool TryFireCallbackEmpty(nint addonPtr)
+    {
+        if (addonPtr == nint.Zero)
+        {
+            return false;
         }
 
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            return false;
+        }
+
+        unitBase->FireCallback(0, null, true);
+        return true;
+    }
+
+    private unsafe bool TryFireRequestSelectFirstSlot(nint addonPtr)
+    {
+        return TryFireRequestFourArgCallback(addonPtr, 2, 0, 44, 0);
+    }
+
+    private unsafe bool TryFireRequestFourArgCallback(nint addonPtr, uint a0, uint a1, uint a2, uint a3)
+    {
+        if (addonPtr == nint.Zero)
+        {
+            return false;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            return false;
+        }
+
+        var values = stackalloc AtkValue[4];
+        values[0].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int;
+        values[0].Int = (int)a0;
+        values[1].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt;
+        values[1].UInt = a1;
+        values[2].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt;
+        values[2].UInt = a2;
+        values[3].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt;
+        values[3].UInt = a3;
+        unitBase->FireCallback(4, values, true);
+        return true;
+    }
+
+    private bool TryFireLearnedBSelectCallback()
+    {
+        if (!bUseLearnedSelectCallback ||
+            string.IsNullOrWhiteSpace(bLearnedSelectAddonName) ||
+            bLearnedSelectCount <= 0)
+        {
+            return false;
+        }
+
+        var addonPtr = gameGui.GetAddonByName(bLearnedSelectAddonName);
+        return TryFireCapturedCallback(addonPtr, bLearnedSelectCount, bLearnedSelectValues);
+    }
+
+    private unsafe bool TryFireCapturedCallback(nint addonPtr, int count, CapturedAtkValue[] captured)
+    {
+        if (addonPtr == nint.Zero || count <= 0)
+        {
+            return false;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            return false;
+        }
+
+        var fireCount = Math.Min(count, captured.Length);
+        var values = stackalloc AtkValue[fireCount];
+        for (var i = 0; i < fireCount; i++)
+        {
+            var cv = captured[i];
+            values[i].Type = cv.Type;
+            if (cv.Type == FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt)
+            {
+                values[i].UInt = cv.UInt;
+            }
+            else
+            {
+                values[i].Int = cv.Int;
+            }
+        }
+
+        unitBase->FireCallback((uint)fireCount, values, true);
+        return true;
+    }
+
+    private void MarkNpcBAction(string addon, string callbackLabel, NpcBStep nextStep)
+    {
         npcBTurnInHadInteraction = true;
         npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
-        chatGui.Print($"[autoLeve] B 流程交貨：{detectedAddon} callback 0");
+        npcBStep = nextStep;
+        chatGui.Print($"[autoLeve] B 流程交貨：{addon} callback {callbackLabel}");
         if (configuration.SemiAutoVerboseLogging)
         {
-            log.Information("Semi-auto leve B action: {Addon} callback 0", detectedAddon);
-        }
-
-        if (detectedAddon == "JournalResult")
-        {
-            Stop("B 流程完成（JournalResult）");
+            log.Information("Semi-auto leve B action: {Addon} callback {Callback}, next={NextStep}", addon, callbackLabel, nextStep);
         }
     }
 
@@ -443,6 +988,10 @@ public sealed class SemiAutoLeveAssistant : IDisposable
 
                 if (detectedAddon != "GuildLeve")
                 {
+                    if (guildLeveAcceptRetryStage > 0)
+                    {
+                        CompleteAFlowAfterAccept();
+                    }
                     guildLeveOpenedAtUtc = DateTime.MinValue;
                     break;
                 }
@@ -458,6 +1007,8 @@ public sealed class SemiAutoLeveAssistant : IDisposable
                     npcAStep = NpcAStep.AwaitGuildLeveAccept;
                     guildLeveSelectStrategy = 0;
                     guildLeveNoProgressCount = 0;
+                    guildLeveAcceptRetryStage = 0;
+                    lastGuildLeveAcceptActionAtUtc = DateTime.MinValue;
                     break;
                 }
 
@@ -549,6 +1100,10 @@ public sealed class SemiAutoLeveAssistant : IDisposable
 
                 if (detectedAddon != "GuildLeve")
                 {
+                    if (guildLeveAcceptRetryStage > 0)
+                    {
+                        npcAStep = NpcAStep.AwaitNpcAInteractionEnd;
+                    }
                     guildLeveOpenedAtUtc = DateTime.MinValue;
                     break;
                 }
@@ -597,35 +1152,163 @@ public sealed class SemiAutoLeveAssistant : IDisposable
                 }
 
                 var acceptCallback = ResolveGuildLeveAcceptCallback(addonPtr);
-                if (TryFireCallbackInt(addonPtr, acceptCallback))
+                if (guildLeveAcceptRetryStage == 0)
                 {
-                    npcAStep = NpcAStep.AwaitTalk;
-                    guildLeveSelectStrategy = 0;
-                    lastGuildLeveDetailTitle = null;
-                    guildLeveNoProgressCount = 0;
-                    guildLeveOpenedAtUtc = DateTime.MinValue;
-                    lastGuildLeveSelectCallbackAtUtc = DateTime.MinValue;
-                    guildLeveTitleBeforeSelectCallback = null;
-                    chatGui.Print($"[autoLeve] 已點擊接受 (cb={acceptCallback})，A 流程完成。");
-                    if (configuration.SemiAutoTestFlowBEnabled)
+                    var acceptSent = false;
+                    var actionTag = string.Empty;
+                    if (configuration.SemiAutoM34UseTwoArgCallback)
                     {
-                        waitingForNpcBTurnIn = true;
-                        npcBTurnInHadInteraction = false;
-                        npcBTurnInStartedAtUtc = DateTime.UtcNow;
-                        npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
-                        chatGui.Print("[autoLeve] 進入 B 流程：請與交貨 NPC 對話，將自動嘗試 callback 0。");
-                        if (configuration.SemiAutoVerboseLogging)
-                        {
-                            log.Information("Semi-auto leve action: GuildLeve accept callback {Callback}", acceptCallback);
-                            log.Information("Semi-auto leve B flow: armed and waiting for turn-in dialogs");
-                        }
+                        acceptSent = TryFireGuildLeveTwoArgCallback(
+                            addonPtr,
+                            configuration.SemiAutoM34TwoArgCmd,
+                            configuration.SemiAutoM34TwoArgLeveId);
+                        actionTag = $"accept-twoarg([{configuration.SemiAutoM34TwoArgCmd},{configuration.SemiAutoM34TwoArgLeveId}])";
                     }
                     else
                     {
-                        Stop("A 流程完成（B 測試停用）");
+                        acceptSent = TryFireCallbackInt(addonPtr, acceptCallback);
+                        actionTag = $"accept-index(cb={acceptCallback})";
                     }
+                    if (acceptSent)
+                    {
+                        guildLeveAcceptRetryStage++;
+                        lastGuildLeveAcceptActionAtUtc = DateTime.UtcNow;
+                        guildLeveExitAfterAcceptSent = false;
+                        lastGuildLeveExitActionAtUtc = DateTime.MinValue;
+                        npcAStep = NpcAStep.AwaitNpcAInteractionEnd;
+                        if (configuration.SemiAutoVerboseLogging)
+                        {
+                            log.Warning(
+                                "Semi-auto leve action: GuildLeve accept send {Action}, attempt={Attempt}",
+                                actionTag,
+                                guildLeveAcceptRetryStage);
+                        }
+                    }
+                    break;
+                }
+
+                if ((DateTime.UtcNow - lastGuildLeveAcceptActionAtUtc).TotalMilliseconds < GuildLeveAcceptTransitionTimeoutMs)
+                {
+                    if (configuration.SemiAutoVerboseLogging)
+                    {
+                        log.Information("Semi-auto leve action: waiting post-accept transition");
+                    }
+                    break;
+                }
+
+                if (configuration.SemiAutoVerboseLogging)
+                {
+                    log.Warning("Semi-auto leve action: accept transition timeout, back to reselect");
+                }
+                guildLeveAcceptRetryStage = 0;
+                npcAStep = NpcAStep.AwaitGuildLeveSelect;
+                guildLeveOpenedAtUtc = DateTime.UtcNow;
+                break;
+
+            case NpcAStep.AwaitNpcAInteractionEnd:
+                if (detectedAddon == "Talk")
+                {
+                    if (configuration.SemiAutoM3AutoAdvanceTalk &&
+                        TryStartActionWindow(180) &&
+                        TryFireCallbackInt(addonPtr, 0) &&
+                        configuration.SemiAutoVerboseLogging)
+                    {
+                        log.Information("Semi-auto leve action: finish NPC A interaction via Talk callback 0");
+                    }
+                    break;
+                }
+
+                if (detectedAddon == "SelectString")
+                {
+                    if (TryStartActionWindow(180))
+                    {
+                        if (TryFindCallbackIndexByText(addonPtr, "取消", out var cancelCb) &&
+                            TryFireCallbackInt(addonPtr, cancelCb))
+                        {
+                            if (configuration.SemiAutoVerboseLogging)
+                            {
+                                log.Information("Semi-auto leve action: finish NPC A interaction via SelectString cancel callback {Callback}", cancelCb);
+                            }
+                            break;
+                        }
+
+                        // fallback: list 最後一項通常是取消
+                        if (TryFireCallbackInt(addonPtr, 3) && configuration.SemiAutoVerboseLogging)
+                        {
+                            log.Information("Semi-auto leve action: finish NPC A interaction via SelectString callback 3");
+                        }
+                    }
+                    break;
+                }
+
+                if (detectedAddon == "GuildLeve")
+                {
+                    if (!guildLeveExitAfterAcceptSent &&
+                        (DateTime.UtcNow - lastGuildLeveAcceptActionAtUtc).TotalMilliseconds > 300)
+                    {
+                        var exitLeveId = configuration.SemiAutoM34TwoArgLeveId > 0
+                            ? configuration.SemiAutoM34TwoArgLeveId
+                            : configuration.SemiAutoGuildLeveSelectLeveId;
+                        if (TryFireGuildLeveTwoArgCallback(addonPtr, 7, exitLeveId))
+                        {
+                            guildLeveExitAfterAcceptSent = true;
+                            lastGuildLeveExitActionAtUtc = DateTime.UtcNow;
+                            if (configuration.SemiAutoVerboseLogging)
+                            {
+                                log.Information("Semi-auto leve action: sent GuildLeve exit callback [7,{LeveId}] after accept", exitLeveId);
+                            }
+                            break;
+                        }
+                    }
+
+                    if (guildLeveExitAfterAcceptSent &&
+                        (DateTime.UtcNow - lastGuildLeveExitActionAtUtc).TotalMilliseconds > 1800)
+                    {
+                        var cancelCallback = ResolveGuildLeveCancelCallback(addonPtr);
+                        if (TryFireCallbackInt(addonPtr, cancelCallback) && configuration.SemiAutoVerboseLogging)
+                        {
+                            log.Warning("Semi-auto leve action: GuildLeve exit timeout, fallback cancel callback {Callback}", cancelCallback);
+                        }
+                        guildLeveExitAfterAcceptSent = false;
+                        lastGuildLeveExitActionAtUtc = DateTime.UtcNow;
+                    }
+                    break;
                 }
                 break;
+        }
+    }
+
+    private void CompleteAFlowAfterAccept()
+    {
+        npcAStep = NpcAStep.AwaitTalk;
+        guildLeveSelectStrategy = 0;
+        lastGuildLeveDetailTitle = null;
+        guildLeveNoProgressCount = 0;
+        guildLeveOpenedAtUtc = DateTime.MinValue;
+        lastGuildLeveSelectCallbackAtUtc = DateTime.MinValue;
+        guildLeveTitleBeforeSelectCallback = null;
+        lastGuildLeveAcceptActionAtUtc = DateTime.MinValue;
+        guildLeveAcceptRetryStage = 0;
+        guildLeveExitAfterAcceptSent = false;
+        lastGuildLeveExitActionAtUtc = DateTime.MinValue;
+        chatGui.Print("[autoLeve] 已點擊接受，A 流程完成。");
+        if (configuration.SemiAutoTestFlowBEnabled)
+        {
+            waitingForNpcBTurnIn = true;
+            npcBStep = NpcBStep.AwaitTalkStart;
+            npcBTurnInHadInteraction = false;
+            npcBTurnInStartedAtUtc = DateTime.UtcNow;
+            npcBTurnInLastInteractionAtUtc = DateTime.UtcNow;
+            chatGui.Print("[autoLeve] 進入 B 流程：Talk(empty) -> Request(4) -> Request(0) -> SelectYesno(0) -> Talk(empty) -> JournalResult(0)。");
+            if (configuration.SemiAutoVerboseLogging)
+            {
+                log.Information("Semi-auto leve action: GuildLeve accept complete");
+                log.Information("Semi-auto leve B flow: armed and waiting for turn-in dialogs");
+            }
+        }
+        else
+        {
+            Stop("A 流程完成（B 測試停用）");
         }
     }
 
@@ -783,6 +1466,16 @@ public sealed class SemiAutoLeveAssistant : IDisposable
 
         // fallback: 保留手動設定值，避免特殊語系或 UI 差異時完全失效
         return Math.Clamp(configuration.SemiAutoGuildLeveAcceptCallback, 0, 2500);
+    }
+
+    private int ResolveGuildLeveCancelCallback(nint addonPtr)
+    {
+        if (TryFindCallbackIndexByText(addonPtr, "取消", out var callbackFromText))
+        {
+            return callbackFromText;
+        }
+
+        return 1492;
     }
 
     private unsafe bool TryResolveGuildLeveStepCallback(nint addonPtr, string targetText, out int callbackIndex)
@@ -1023,6 +1716,60 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         return true;
     }
 
+    private unsafe bool TryFireGuildLeveTwoArgCallback(nint addonPtr, int cmd, int leveId)
+    {
+        if (addonPtr == nint.Zero || leveId <= 0)
+        {
+            return false;
+        }
+
+        var unitBase = (AtkUnitBase*)addonPtr;
+        if (unitBase == null || !unitBase->IsVisible)
+        {
+            return false;
+        }
+
+        var values = stackalloc AtkValue[2];
+        values[0].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int;
+        values[0].Int = cmd;
+        values[1].Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt;
+        values[1].UInt = (uint)Math.Max(0, leveId);
+        unitBase->FireCallback(2, values, true);
+        return true;
+    }
+
+    private bool TryFireDebugRequestCallback(int callback)
+    {
+        foreach (var addonName in new[] { "Request", "RequestItem" })
+        {
+            var addonPtr = gameGui.GetAddonByName(addonName);
+            if (TryFireCallbackInt(addonPtr, callback))
+            {
+                if (configuration.SemiAutoVerboseLogging)
+                {
+                    log.Information("Semi-auto leve debug B: {Addon} callback {Callback}", addonName, callback);
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static unsafe void FillGenericAtkValue(AtkValue* values, int index, int rawType, int rawValue)
+    {
+        var type = (FFXIVClientStructs.FFXIV.Component.GUI.ValueType)rawType;
+        values[index].Type = type;
+        if (type == FFXIVClientStructs.FFXIV.Component.GUI.ValueType.UInt)
+        {
+            values[index].UInt = unchecked((uint)rawValue);
+        }
+        else
+        {
+            values[index].Int = rawValue;
+        }
+    }
+
     private int ResolveGuildLeveEntryCallback(GuildLeveEntry entry)
     {
         // strategy=0: ListIndex。strategy=1 時會優先嘗試 raw-text callback。
@@ -1254,7 +2001,9 @@ public sealed class SemiAutoLeveAssistant : IDisposable
 
         var isGuildCaptureActive = IsGuildLeveCallbackCaptureActive();
         var isNpcBCaptureActive = IsNpcBCallbackCaptureActive();
-        if (!isGuildCaptureActive && !isNpcBCaptureActive)
+        var isAnyCaptureActive = IsAnyCallbackCaptureActive();
+        var isFlowDiagActive = IsFlowDiagnosticCaptureActive();
+        if (!isGuildCaptureActive && !isNpcBCaptureActive && !isAnyCaptureActive && !isFlowDiagActive)
         {
             return;
         }
@@ -1262,13 +2011,70 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         var callerAddon = ResolveAddonNameByUnitBase((nint)unitBase);
         if (callerAddon is null)
         {
+            if (isAnyCaptureActive)
+            {
+                LogGenericCapturedCallback("(unknown)", (nint)unitBase, valueCount, values, updateState);
+            }
+            if (isFlowDiagActive)
+            {
+                LogFlowDiagnosticCapturedCallback("(unknown)", (nint)unitBase, valueCount, values, updateState);
+            }
+            if (isGuildCaptureActive && guildLeveCaptureMode == GuildLeveCaptureMode.AcceptOnly)
+            {
+                var countUnknown = (int)valueCount;
+                log.Warning(
+                    "Semi-auto leve hook: unknown addon callback while waiting accept, ptr=0x{Ptr:X}, count={Count}, updateState={UpdateState}",
+                    (nint)unitBase,
+                    countUnknown,
+                    updateState);
+                for (var i = 0; i < countUnknown; i++)
+                {
+                    log.Warning("Semi-auto leve hook: unknown cb[{Index}]={Value}", i, DescribeAtkValue(values[i]));
+                }
+            }
+            if (isNpcBCaptureActive)
+            {
+                var countUnknown = (int)valueCount;
+                log.Warning(
+                    "Semi-auto leve hook: unknown addon callback while waiting B flow, ptr=0x{Ptr:X}, count={Count}, updateState={UpdateState}",
+                    (nint)unitBase,
+                    countUnknown,
+                    updateState);
+                for (var i = 0; i < countUnknown; i++)
+                {
+                    log.Warning("Semi-auto leve hook: B unknown cb[{Index}]={Value}", i, DescribeAtkValue(values[i]));
+                }
+            }
             return;
         }
 
         var count = (int)valueCount;
 
+        if (isAnyCaptureActive)
+        {
+            LogGenericCapturedCallback(callerAddon, (nint)unitBase, valueCount, values, updateState);
+        }
+        if (isFlowDiagActive)
+        {
+            LogFlowDiagnosticCapturedCallback(callerAddon, (nint)unitBase, valueCount, values, updateState);
+        }
+
         if (isGuildCaptureActive && callerAddon == "GuildLeve")
         {
+            if (guildLeveCaptureMode == GuildLeveCaptureMode.AcceptOnly &&
+                LooksLikeGuildLeveSelectionCallback(valueCount, values))
+            {
+                if (configuration.SemiAutoVerboseLogging)
+                {
+                    log.Information("Semi-auto leve hook: skip GuildLeve select-like callback while waiting accept (count={Count})", count);
+                    for (var i = 0; i < count; i++)
+                    {
+                        log.Information("Semi-auto leve hook: skipped GuildLeve cb[{Index}]={Value}", i, DescribeAtkValue(values[i]));
+                    }
+                }
+                return;
+            }
+
             guildLeveCallbackCaptureRemaining--;
             log.Warning(
                 "Semi-auto leve hook: GuildLeve callback captured, count={Count}, updateState={UpdateState}, remaining={Remaining}",
@@ -1285,6 +2091,11 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             {
                 guildLeveCallbackCaptureArmed = false;
                 chatGui.Print("[autoLeve] GuildLeve callback 捕捉結束（已達上限）。");
+            }
+            else if (guildLeveCaptureMode == GuildLeveCaptureMode.AcceptOnly)
+            {
+                guildLeveCallbackCaptureArmed = false;
+                chatGui.Print("[autoLeve] M3-4 接受 callback 已捕捉完成。");
             }
         }
 
@@ -1345,6 +2156,293 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         return true;
     }
 
+    private bool IsAnyCallbackCaptureActive()
+    {
+        if (!anyCallbackCaptureArmed)
+        {
+            return false;
+        }
+
+        if (anyCallbackCaptureRemaining <= 0 || DateTime.UtcNow > anyCallbackCaptureUntilUtc)
+        {
+            anyCallbackCaptureArmed = false;
+            if (!anyCallbackCaptureSawData)
+            {
+                chatGui.Print("[autoLeve] 通用 callback 捕捉結束：0筆。這一步可能不是 FireCallback（可能是 DragDrop/事件鏈）。");
+            }
+            else
+            {
+                chatGui.Print("[autoLeve] 通用 callback 捕捉結束（逾時/已停止）。");
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool IsFlowDiagnosticCaptureActive()
+    {
+        if (!flowDiagnosticCaptureArmed)
+        {
+            return false;
+        }
+
+        if (flowDiagnosticCaptureRemaining <= 0 || DateTime.UtcNow > flowDiagnosticCaptureUntilUtc)
+        {
+            flowDiagnosticCaptureArmed = false;
+            chatGui.Print("[autoLeve] 流程診斷捕捉結束（逾時/已停止）。");
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool IsAnyReceiveCaptureActive()
+    {
+        if (!anyReceiveCaptureArmed)
+        {
+            return false;
+        }
+
+        if (anyReceiveCaptureRemaining <= 0 || DateTime.UtcNow > anyReceiveCaptureUntilUtc)
+        {
+            anyReceiveCaptureArmed = false;
+            ClearAddonEventCaptureHandles();
+            if (!anyReceiveCaptureSawData)
+            {
+                chatGui.Print("[autoLeve] ReceiveEvent 捕捉結束：0筆。此操作可能不是 UI ReceiveEvent。");
+            }
+            else
+            {
+                chatGui.Print("[autoLeve] ReceiveEvent 捕捉結束（逾時/已停止）。");
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    private void OnAddonPreReceiveEvent(AddonEvent type, AddonArgs args)
+    {
+        if (!IsAnyReceiveCaptureActive())
+        {
+            return;
+        }
+
+        if (args is not AddonReceiveEventArgs receive)
+        {
+            return;
+        }
+
+        anyReceiveCaptureSawData = true;
+        anyReceiveCaptureRemaining--;
+
+        var addonName = args.AddonName;
+        lastReceiveAddonName = addonName;
+        lastReceiveEventType = (int)receive.AtkEventType;
+        lastReceiveEventParam = receive.EventParam;
+        lastReceiveCaptureSummary =
+            $"{addonName} type={(int)receive.AtkEventType} param={receive.EventParam} event=0x{receive.AtkEvent:X} data=0x{receive.Data:X}";
+
+        log.Warning(
+            "Semi-auto leve receive capture: addon={Addon}, eventType={EventType}, param={Param}, eventPtr=0x{EventPtr:X}, dataPtr=0x{DataPtr:X}, remaining={Remaining}",
+            addonName,
+            (int)receive.AtkEventType,
+            receive.EventParam,
+            receive.AtkEvent,
+            receive.Data,
+            anyReceiveCaptureRemaining);
+
+        if (anyReceiveCaptureRemaining <= 0)
+        {
+            anyReceiveCaptureArmed = false;
+            ClearAddonEventCaptureHandles();
+            chatGui.Print("[autoLeve] ReceiveEvent 單步捕捉完成。");
+        }
+    }
+
+    private void TryAttachAddonEventCapture()
+    {
+        if (!anyReceiveCaptureArmed || addonEventCaptureHandles.Count > 0)
+        {
+            return;
+        }
+
+        foreach (var addonName in new[] { "Request", "RequestItem", "InventoryExpansion" })
+        {
+            var addonPtr = gameGui.GetAddonByName(addonName);
+            if (addonPtr == nint.Zero)
+            {
+                continue;
+            }
+
+            unsafe
+            {
+                var unit = (AtkUnitBase*)addonPtr;
+                if (unit == null || !unit->IsVisible)
+                {
+                    continue;
+                }
+            }
+
+            foreach (var eventType in CaptureEventTypes)
+            {
+                var handle = addonEventManager.AddEvent(addonPtr, nint.Zero, eventType, OnAddonEventCaptured);
+                if (handle != null)
+                {
+                    addonEventCaptureHandles.Add(handle);
+                }
+            }
+
+            if (addonEventCaptureHandles.Count > 0)
+            {
+                addonEventCaptureAddonPtr = addonPtr;
+                addonEventCaptureAddonName = addonName;
+                chatGui.Print($"[autoLeve] 已綁定 UI事件捕捉: addon={addonName}, events={addonEventCaptureHandles.Count}");
+                return;
+            }
+        }
+
+        chatGui.Print("[autoLeve] UI事件捕捉尚未綁定：請先打開 Request/RequestItem 視窗再按一次。");
+    }
+
+    private void ClearAddonEventCaptureHandles()
+    {
+        if (addonEventCaptureHandles.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var handle in addonEventCaptureHandles)
+        {
+            addonEventManager.RemoveEvent(handle);
+        }
+
+        addonEventCaptureHandles.Clear();
+        addonEventCaptureAddonPtr = nint.Zero;
+        addonEventCaptureAddonName = null;
+    }
+
+    private void OnAddonEventCaptured(AddonEventType eventType, AddonEventData data)
+    {
+        if (!IsAnyReceiveCaptureActive())
+        {
+            return;
+        }
+
+        anyReceiveCaptureSawData = true;
+        anyReceiveCaptureRemaining--;
+
+        var addonName = addonEventCaptureAddonName ?? ResolveAddonNameByUnitBase(data.AddonPointer) ?? "(unknown)";
+        lastReceiveAddonName = addonName;
+        lastReceiveEventType = (int)data.AtkEventType;
+        lastReceiveEventParam = unchecked((int)data.Param);
+        lastReceiveCaptureSummary =
+            $"{addonName} mgrType={(int)eventType} atkType={(int)data.AtkEventType} param={data.Param} addon=0x{data.AddonPointer:X} node=0x{data.NodeTargetPointer:X}";
+
+        log.Warning(
+            "Semi-auto leve addon-event capture: addon={Addon}, mgrType={MgrType}, atkType={AtkType}, param={Param}, addonPtr=0x{AddonPtr:X}, nodePtr=0x{NodePtr:X}, remaining={Remaining}",
+            addonName,
+            (int)eventType,
+            (int)data.AtkEventType,
+            data.Param,
+            data.AddonPointer,
+            data.NodeTargetPointer,
+            anyReceiveCaptureRemaining);
+
+        if (anyReceiveCaptureRemaining <= 0)
+        {
+            anyReceiveCaptureArmed = false;
+            ClearAddonEventCaptureHandles();
+            chatGui.Print("[autoLeve] ReceiveEvent 單步捕捉完成。");
+        }
+    }
+
+    private unsafe void LogGenericCapturedCallback(string addonName, nint unitBasePtr, uint valueCount, AtkValue* values, bool updateState)
+    {
+        anyCallbackCaptureRemaining--;
+        anyCallbackCaptureSawData = true;
+        var count = (int)valueCount;
+        var argText = string.Join(", ", Enumerable.Range(0, count).Select(i => DescribeAtkValue(values[i])));
+        lastGenericCaptureSummary = $"{addonName} ptr=0x{unitBasePtr:X} count={count} updateState={updateState} args=[{argText}]";
+        lastCapturedAddonName = addonName;
+        lastCapturedCount = Math.Min(count, lastCapturedValues.Length);
+        for (var i = 0; i < lastCapturedCount; i++)
+        {
+            lastCapturedValues[i] = new CapturedAtkValue(values[i]);
+        }
+        log.Warning(
+            "Semi-auto leve hook: generic callback captured, addon={Addon}, ptr=0x{Ptr:X}, count={Count}, updateState={UpdateState}, remaining={Remaining}",
+            addonName,
+            unitBasePtr,
+            count,
+            updateState,
+            anyCallbackCaptureRemaining);
+
+        for (var i = 0; i < count; i++)
+        {
+            log.Warning("Semi-auto leve hook: generic {Addon} cb[{Index}]={Value}", addonName, i, DescribeAtkValue(values[i]));
+        }
+
+        if (anyCallbackCaptureRemaining <= 0)
+        {
+            anyCallbackCaptureArmed = false;
+            chatGui.Print("[autoLeve] 通用 callback 捕捉結束（已達上限）。");
+        }
+    }
+
+    private unsafe void LogFlowDiagnosticCapturedCallback(string addonName, nint unitBasePtr, uint valueCount, AtkValue* values, bool updateState)
+    {
+        flowDiagnosticCaptureRemaining--;
+        var count = (int)valueCount;
+        log.Warning(
+            "Semi-auto leve hook: flowdiag captured, addon={Addon}, ptr=0x{Ptr:X}, count={Count}, updateState={UpdateState}, step={Step}, waitingB={WaitingB}, lastAddon={LastAddon}, remaining={Remaining}",
+            addonName,
+            unitBasePtr,
+            count,
+            updateState,
+            npcAStep,
+            waitingForNpcBTurnIn,
+            lastDetectedAddon ?? "(none)",
+            flowDiagnosticCaptureRemaining);
+
+        for (var i = 0; i < count; i++)
+        {
+            log.Warning("Semi-auto leve hook: flowdiag {Addon} cb[{Index}]={Value}", addonName, i, DescribeAtkValue(values[i]));
+        }
+
+        LogVisibleAddonPointersForDiagnostic();
+
+        if (flowDiagnosticCaptureRemaining <= 0)
+        {
+            flowDiagnosticCaptureArmed = false;
+            chatGui.Print("[autoLeve] 流程診斷捕捉結束（已達上限）。");
+        }
+    }
+
+    private void LogVisibleAddonPointersForDiagnostic()
+    {
+        foreach (var addonName in WatchedAddonNames)
+        {
+            var ptr = gameGui.GetAddonByName(addonName);
+            if (ptr == nint.Zero)
+            {
+                continue;
+            }
+
+            unsafe
+            {
+                var unit = (AtkUnitBase*)ptr;
+                if (unit == null || !unit->IsVisible)
+                {
+                    continue;
+                }
+            }
+
+            log.Warning("Semi-auto leve hook: flowdiag visible addon={Addon}, ptr=0x{Ptr:X}", addonName, ptr);
+        }
+    }
+
     private string? ResolveAddonNameByUnitBase(nint unitBasePtr)
     {
         foreach (var addonName in WatchedAddonNames)
@@ -1359,6 +2457,14 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         return null;
     }
 
+    private readonly record struct CapturedAtkValue(FFXIVClientStructs.FFXIV.Component.GUI.ValueType Type, int Int, uint UInt)
+    {
+        public CapturedAtkValue(AtkValue value)
+            : this(value.Type, value.Int, value.UInt)
+        {
+        }
+    }
+
     private static unsafe string DescribeAtkValue(AtkValue value)
     {
         return value.Type switch
@@ -1370,6 +2476,24 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             FFXIVClientStructs.FFXIV.Component.GUI.ValueType.String => $"String:\"{ReadUtf8String(value.String)}\"",
             _ => $"{value.Type}:{value.Int}",
         };
+    }
+
+    private static unsafe bool LooksLikeGuildLeveSelectionCallback(uint valueCount, AtkValue* values)
+    {
+        if (valueCount < 3 || values == null)
+        {
+            return false;
+        }
+
+        if (values[0].Type != FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int ||
+            values[1].Type != FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int ||
+            values[2].Type != FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int)
+        {
+            return false;
+        }
+
+        // 已知 M3-3 選理符常見 signature: [13, x, 16xx]
+        return values[0].Int == 13 && values[2].Int >= 1600 && values[2].Int <= 1999;
     }
 
     private static unsafe string ReadUtf8String(byte* ptr)
