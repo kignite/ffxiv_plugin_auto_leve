@@ -138,6 +138,94 @@ public class ConfigWindow : Window, IDisposable
             configuration.Save();
         }
 
+        ImGui.Separator();
+        ImGui.Text("M3-3 / M3-4 測試工具");
+
+        var m33Arg0 = configuration.SemiAutoGuildLeveSelectArg0;
+        var m33Arg1 = configuration.SemiAutoGuildLeveSelectArg1;
+        var m33LeveId = configuration.SemiAutoGuildLeveSelectLeveId;
+
+        if (ImGui.InputInt("M3-3 arg0", ref m33Arg0))
+        {
+            configuration.SemiAutoGuildLeveSelectArg0 = m33Arg0;
+            configuration.Save();
+        }
+        if (ImGui.InputInt("M3-3 arg1", ref m33Arg1))
+        {
+            configuration.SemiAutoGuildLeveSelectArg1 = m33Arg1;
+            configuration.Save();
+        }
+        if (ImGui.InputInt("M3-3 leveId", ref m33LeveId))
+        {
+            configuration.SemiAutoGuildLeveSelectLeveId = Math.Max(0, m33LeveId);
+            configuration.Save();
+        }
+
+        if (ImGui.Button("測試 M3-3 callback"))
+        {
+            plugin.SemiAutoAssistant.DebugSelectGuildLeveByCallbackArgs(
+                configuration.SemiAutoGuildLeveSelectArg0,
+                configuration.SemiAutoGuildLeveSelectArg1,
+                configuration.SemiAutoGuildLeveSelectLeveId);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("單步測試：選中高山茶"))
+        {
+            plugin.SemiAutoAssistant.DebugSelectGuildLeveByCallbackArgs(
+                configuration.SemiAutoGuildLeveSelectArg0,
+                configuration.SemiAutoGuildLeveSelectArg1,
+                configuration.SemiAutoGuildLeveSelectLeveId);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("同步到自動 M3-3"))
+        {
+            plugin.SemiAutoAssistant.ApplyGuildLeveSelectCallbackToAuto(
+                configuration.SemiAutoGuildLeveSelectArg0,
+                configuration.SemiAutoGuildLeveSelectArg1,
+                configuration.SemiAutoGuildLeveSelectLeveId);
+        }
+
+        var m34UseTwoArg = configuration.SemiAutoM34UseTwoArgCallback;
+        if (ImGui.Checkbox("M3-4 使用2參數 callback", ref m34UseTwoArg))
+        {
+            configuration.SemiAutoM34UseTwoArgCallback = m34UseTwoArg;
+            configuration.Save();
+        }
+
+        var m34Cmd = configuration.SemiAutoM34TwoArgCmd;
+        var m34LeveId = configuration.SemiAutoM34TwoArgLeveId;
+        if (ImGui.InputInt("M3-4 cmd", ref m34Cmd))
+        {
+            configuration.SemiAutoM34TwoArgCmd = m34Cmd;
+            configuration.Save();
+        }
+        if (ImGui.InputInt("M3-4 leveId", ref m34LeveId))
+        {
+            configuration.SemiAutoM34TwoArgLeveId = Math.Max(0, m34LeveId);
+            configuration.Save();
+        }
+
+        if (ImGui.Button("測試 M3-4 2參數 callback"))
+        {
+            plugin.SemiAutoAssistant.DebugAcceptGuildLeveByTwoArgCallback(
+                configuration.SemiAutoM34TwoArgCmd,
+                configuration.SemiAutoM34TwoArgLeveId);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("單步測試：點擊接受"))
+        {
+            plugin.SemiAutoAssistant.DebugAcceptGuildLeveByTwoArgCallback(
+                configuration.SemiAutoM34TwoArgCmd,
+                configuration.SemiAutoM34TwoArgLeveId);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("同步到自動 M3-4"))
+        {
+            plugin.SemiAutoAssistant.ApplyGuildLeveAcceptTwoArgToAuto(
+                configuration.SemiAutoM34TwoArgCmd,
+                configuration.SemiAutoM34TwoArgLeveId);
+        }
+
         var detectRadius = configuration.NpcDetectRadius;
         if (ImGui.SliderFloat("NPC 判定半徑", ref detectRadius, 2f, 20f, "%.1f"))
         {
