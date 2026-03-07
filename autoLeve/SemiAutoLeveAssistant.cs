@@ -283,22 +283,18 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
         if (configuration.SemiAutoTestFlowAEnabled && configuration.SemiAutoTestFlowBEnabled)
         {
-            if (configuration.SemiAutoTargetTurnInCount > 0)
-            {
-                chatGui.Print($"[autoLeve] 已開始 {configuration.SemiAutoTargetTurnInCount} 次理符繳交循環。");
-            }
-            else
-            {
-                chatGui.Print("[autoLeve] 已開始理符繳交循環（不限次數）。");
-            }
+            var countLabel = configuration.SemiAutoTargetTurnInCount > 0
+                ? $"{configuration.SemiAutoTargetTurnInCount} 次"
+                : "不限次數";
+            chatGui.Print($"[autoLeve] 開始執行理符循環：{countLabel}");
         }
         else if (configuration.SemiAutoTestFlowAEnabled)
         {
-            chatGui.Print("[autoLeve] 半自動理符助手已啟動，模式=A-only（只接理符）。");
+            chatGui.Print("[autoLeve] 開始執行理符流程：A-only");
         }
         else
         {
-            chatGui.Print("[autoLeve] 半自動理符助手已啟動，模式=B-only（只繳交）。");
+            chatGui.Print("[autoLeve] 開始執行理符流程：B-only");
         }
     }
 
@@ -343,7 +339,7 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         }
         if (!string.IsNullOrWhiteSpace(reason))
         {
-            chatGui.Print($"[autoLeve] 半自動理符助手停止：{reason}");
+            chatGui.Print($"[autoLeve] 結束任務：{reason}");
         }
     }
 
@@ -1667,7 +1663,6 @@ public sealed class SemiAutoLeveAssistant : IDisposable
             return false;
         }
 
-        chatGui.Print("[autoLeve] 偵測到理符次數耗盡（受理限額=0），停止自動循環。");
         if (configuration.SemiAutoVerboseLogging)
         {
             log.Warning("Semi-auto leve stop: allowance exhausted (source={Source})", source);
@@ -1831,7 +1826,6 @@ public sealed class SemiAutoLeveAssistant : IDisposable
         {
             pendingSwitchToAAfterDialogClose = true;
             pendingSwitchToAStartedAtUtc = DateTime.UtcNow;
-            chatGui.Print("[autoLeve] B 流程完成，等待離開對話後切回 attack1。");
             TransitionTo(SemiAutoLeveState.WaitingForNpcDialog);
             return;
         }
